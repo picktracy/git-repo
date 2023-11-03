@@ -32,6 +32,8 @@ import textwrap
 import time
 import urllib.request
 
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+
 from repo_logging import RepoLogger
 
 
