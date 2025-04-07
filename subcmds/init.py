@@ -21,10 +21,9 @@ from command import MirrorSafeCommand
 from error import RepoUnhandledExceptionError
 from error import UpdateManifestError
 from git_command import git_require
-from git_command import MIN_GIT_VERSION_HARD
-from git_command import MIN_GIT_VERSION_SOFT
 from repo_logging import RepoLogger
 from wrapper import Wrapper
+from wrapper import WrapperDir
 
 
 logger = RepoLogger(__file__)
@@ -52,6 +51,10 @@ argument.
 The optional -b argument can be used to select the manifest branch
 to checkout and use.  If no branch is specified, the remote's default
 branch is used.  This is equivalent to using -b HEAD.
+
+The optional --manifest-upstream-branch argument can be used when a commit is
+provided to --manifest-branch (or -b), to specify the name of the git ref in
+which the commit can be found.
 
 The optional -m argument can be used to specify an alternate manifest
 to be used. If no manifest is specified, the manifest default.xml
@@ -136,6 +139,7 @@ to update the working directory files.
         # manifest project is special and is created when instantiating the
         # manifest which happens before we parse options.
         self.manifest.manifestProject.clone_depth = opt.manifest_depth
+        self.manifest.manifestProject.upstream = opt.manifest_upstream_branch
         clone_filter_for_depth = (
             "blob:none" if (_REPO_ALLOW_SHALLOW == "0") else None
         )
@@ -215,7 +219,7 @@ to update the working directory files.
 
             if not opt.quiet:
                 print()
-            print("Your identity is: %s <%s>" % (name, email))
+            print(f"Your identity is: {name} <{email}>")
             print("is this correct [y/N]? ", end="", flush=True)
             a = sys.stdin.readline().strip().lower()
             if a in ("yes", "y", "t", "true"):
@@ -318,6 +322,12 @@ to update the working directory files.
                 " be used with --standalone-manifest."
             )
 
+        if opt.manifest_upstream_branch and opt.manifest_branch is None:
+            self.OptionParser.error(
+                "--manifest-upstream-branch cannot be used without "
+                "--manifest-branch."
+            )
+
         if args:
             if opt.manifest_url:
                 self.OptionParser.error(
@@ -331,13 +341,17 @@ to update the working directory files.
                 self.OptionParser.error("too many arguments to init")
 
     def Execute(self, opt, args):
-        git_require(MIN_GIT_VERSION_HARD, fail=True)
-        if not git_require(MIN_GIT_VERSION_SOFT):
+        wrapper = Wrapper()
+
+        reqs = wrapper.Requirements.from_dir(WrapperDir())
+        git_require(reqs.get_hard_ver("git"), fail=True)
+        min_git_version_soft = reqs.get_soft_ver("git")
+        if not git_require(min_git_version_soft):
             logger.warning(
                 "repo: warning: git-%s+ will soon be required; "
                 "please upgrade your version of git to maintain "
                 "support.",
-                ".".join(str(x) for x in MIN_GIT_VERSION_SOFT),
+                ".".join(str(x) for x in min_git_version_soft),
             )
 
         rp = self.manifest.repoProject
@@ -350,10 +364,9 @@ to update the working directory files.
 
         # Handle new --repo-rev requests.
         if opt.repo_rev:
-            wrapper = Wrapper()
             try:
                 remote_ref, rev = wrapper.check_repo_rev(
-                    rp.gitdir,
+                    rp.worktree,
                     opt.repo_rev,
                     repo_verify=opt.repo_verify,
                     quiet=opt.quiet,

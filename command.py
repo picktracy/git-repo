@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import multiprocessing
 import optparse
 import os
@@ -46,7 +47,7 @@ class UsageError(RepoExitError):
     """Exception thrown with invalid command usage."""
 
 
-class Command(object):
+class Command:
     """Base class for any command line action in repo."""
 
     # Singleton for all commands to track overall repo command execution and
@@ -69,6 +70,14 @@ class Command(object):
     # This is only checked after calling ValidateOptions, so that partially
     # migrated subcommands can set it to False.
     MULTI_MANIFEST_SUPPORT = True
+
+    # Shared data across parallel execution workers.
+    _parallel_context = None
+
+    @classmethod
+    def get_parallel_context(cls):
+        assert cls._parallel_context is not None
+        return cls._parallel_context
 
     def __init__(
         self,
@@ -242,9 +251,39 @@ class Command(object):
         """Perform the action, after option parsing is complete."""
         raise NotImplementedError
 
-    @staticmethod
+    @classmethod
+    @contextlib.contextmanager
+    def ParallelContext(cls):
+        """Obtains the context, which is shared to ExecuteInParallel workers.
+
+        Callers can store data in the context dict before invocation of
+        ExecuteInParallel. The dict will then be shared to child workers of
+        ExecuteInParallel.
+        """
+        assert cls._parallel_context is None
+        cls._parallel_context = {}
+        try:
+            yield
+        finally:
+            cls._parallel_context = None
+
+    @classmethod
+    def _InitParallelWorker(cls, context, initializer):
+        cls._parallel_context = context
+        if initializer:
+            initializer()
+
+    @classmethod
     def ExecuteInParallel(
-        jobs, func, inputs, callback, output=None, ordered=False
+        cls,
+        jobs,
+        func,
+        inputs,
+        callback,
+        output=None,
+        ordered=False,
+        chunksize=WORKER_BATCH_SIZE,
+        initializer=None,
     ):
         """Helper for managing parallel execution boiler plate.
 
@@ -269,6 +308,9 @@ class Command(object):
             output: An output manager. May be progress.Progess or
                 color.Coloring.
             ordered: Whether the jobs should be processed in order.
+            chunksize: The number of jobs processed in batch by parallel
+                workers.
+            initializer: Worker initializer.
 
         Returns:
             The |callback| function's results are returned.
@@ -278,19 +320,23 @@ class Command(object):
             if len(inputs) == 1 or jobs == 1:
                 return callback(None, output, (func(x) for x in inputs))
             else:
-                with multiprocessing.Pool(jobs) as pool:
+                with multiprocessing.Pool(
+                    jobs,
+                    initializer=cls._InitParallelWorker,
+                    initargs=(cls._parallel_context, initializer),
+                ) as pool:
                     submit = pool.imap if ordered else pool.imap_unordered
                     return callback(
                         pool,
                         output,
-                        submit(func, inputs, chunksize=WORKER_BATCH_SIZE),
+                        submit(func, inputs, chunksize=chunksize),
                     )
         finally:
             if isinstance(output, progress.Progress):
                 output.end()
 
     def _ResetPathToProjectMap(self, projects):
-        self._by_path = dict((p.worktree, p) for p in projects)
+        self._by_path = {p.worktree: p for p in projects}
 
     def _UpdatePathToProjectMap(self, project):
         self._by_path[project.worktree] = project
@@ -476,8 +522,7 @@ class Command(object):
             top = self.manifest
         yield top
         if not opt.this_manifest_only:
-            for child in top.all_children:
-                yield child
+            yield from top.all_children
 
 
 class InteractiveCommand(Command):
@@ -498,11 +543,7 @@ class PagedCommand(Command):
         return True
 
 
-class MirrorSafeCommand(object):
+class MirrorSafeCommand:
     """Command permits itself to run within a mirror, and does not require a
     working directory.
     """
-
-
-class GitcClientCommand(object):
-    """Command that requires the local client to be a GITC client."""

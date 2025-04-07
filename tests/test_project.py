@@ -48,7 +48,7 @@ def TempGitTree():
         yield tempdir
 
 
-class FakeProject(object):
+class FakeProject:
     """A fake for Project for basic functionality."""
 
     def __init__(self, worktree):
@@ -107,6 +107,16 @@ class ReviewableBranchTests(unittest.TestCase):
             self.assertTrue(rb.date)
 
 
+class ProjectTests(unittest.TestCase):
+    """Check Project behavior."""
+
+    def test_encode_patchset_description(self):
+        self.assertEqual(
+            project.Project._encode_patchset_description("abcd00!! +"),
+            "abcd00%21%21_%2b",
+        )
+
+
 class CopyLinkTestCase(unittest.TestCase):
     """TestCase for stub repo client checkouts.
 
@@ -151,7 +161,7 @@ class CopyLinkTestCase(unittest.TestCase):
                     # "".
                     break
                 result = os.path.exists(path)
-                msg.append("\tos.path.exists(%s): %s" % (path, result))
+                msg.append(f"\tos.path.exists({path}): {result}")
                 if result:
                     msg.append("\tcontents: %r" % os.listdir(path))
                     break
@@ -507,7 +517,10 @@ class ManifestPropertiesFetchedCorrectly(unittest.TestCase):
             self.assertFalse(fakeproj.partial_clone)
 
             fakeproj.config.SetString("repo.depth", "48")
-            self.assertEqual(fakeproj.depth, "48")
+            self.assertEqual(fakeproj.depth, 48)
+
+            fakeproj.config.SetString("repo.depth", "invalid_depth")
+            self.assertEqual(fakeproj.depth, None)
 
             fakeproj.config.SetString("repo.clonefilter", "blob:limit=10M")
             self.assertEqual(fakeproj.clone_filter, "blob:limit=10M")

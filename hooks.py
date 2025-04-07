@@ -12,11 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import errno
-import json
 import os
 import re
-import subprocess
 import sys
 import traceback
 import urllib.parse
@@ -25,7 +22,7 @@ from error import HookError
 from git_refs import HEAD
 
 
-class RepoHook(object):
+class RepoHook:
     """A RepoHook contains information about a script to run as a hook.
 
     Hooks are used to run a python script before running an upload (for
@@ -183,7 +180,7 @@ class RepoHook(object):
                 abort_if_user_denies was passed to the consturctor.
         """
         hooks_config = self._hooks_project.config
-        git_approval_key = "repo.hooks.%s.%s" % (self._hook_type, subkey)
+        git_approval_key = f"repo.hooks.{self._hook_type}.{subkey}"
 
         # Get the last value that the user approved for this hook; may be None.
         old_val = hooks_config.GetString(git_approval_key)
@@ -196,7 +193,7 @@ class RepoHook(object):
             else:
                 # Give the user a reason why we're prompting, since they last
                 # told us to "never ask again".
-                prompt = "WARNING: %s\n\n" % (changed_prompt,)
+                prompt = f"WARNING: {changed_prompt}\n\n"
         else:
             prompt = ""
 
@@ -244,9 +241,8 @@ class RepoHook(object):
         return self._CheckForHookApprovalHelper(
             "approvedmanifest",
             self._manifest_url,
-            "Run hook scripts from %s" % (self._manifest_url,),
-            "Manifest URL has changed since %s was allowed."
-            % (self._hook_type,),
+            f"Run hook scripts from {self._manifest_url}",
+            f"Manifest URL has changed since {self._hook_type} was allowed.",
         )
 
     def _CheckForHookApprovalHash(self):
@@ -265,7 +261,7 @@ class RepoHook(object):
             "approvedhash",
             self._GetHash(),
             prompt % (self._GetMustVerb(), self._script_fullpath),
-            "Scripts have changed since %s was allowed." % (self._hook_type,),
+            f"Scripts have changed since {self._hook_type} was allowed.",
         )
 
     @staticmethod
@@ -297,43 +293,6 @@ class RepoHook(object):
             interp = m.group(2)
 
         return interp
-
-    def _ExecuteHookViaReexec(self, interp, context, **kwargs):
-        """Execute the hook script through |interp|.
-
-        Note: Support for this feature should be dropped ~Jun 2021.
-
-        Args:
-            interp: The Python program to run.
-            context: Basic Python context to execute the hook inside.
-            kwargs: Arbitrary arguments to pass to the hook script.
-
-        Raises:
-            HookError: When the hooks failed for any reason.
-        """
-        # This logic needs to be kept in sync with _ExecuteHookViaImport below.
-        script = """
-import json, os, sys
-path = '''%(path)s'''
-kwargs = json.loads('''%(kwargs)s''')
-context = json.loads('''%(context)s''')
-sys.path.insert(0, os.path.dirname(path))
-data = open(path).read()
-exec(compile(data, path, 'exec'), context)
-context['main'](**kwargs)
-""" % {
-            "path": self._script_fullpath,
-            "kwargs": json.dumps(kwargs),
-            "context": json.dumps(context),
-        }
-
-        # We pass the script via stdin to avoid OS argv limits.  It also makes
-        # unhandled exception tracebacks less verbose/confusing for users.
-        cmd = [interp, "-c", "import sys; exec(sys.stdin.read())"]
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-        proc.communicate(input=script.encode("utf-8"))
-        if proc.returncode:
-            raise HookError("Failed to run %s hook." % (self._hook_type,))
 
     def _ExecuteHookViaImport(self, data, context, **kwargs):
         """Execute the hook code in |data| directly.
@@ -412,30 +371,13 @@ context['main'](**kwargs)
             # See what version of python the hook has been written against.
             data = open(self._script_fullpath).read()
             interp = self._ExtractInterpFromShebang(data)
-            reexec = False
             if interp:
                 prog = os.path.basename(interp)
-                if prog.startswith("python2") and sys.version_info.major != 2:
-                    reexec = True
-                elif prog.startswith("python3") and sys.version_info.major == 2:
-                    reexec = True
-
-            # Attempt to execute the hooks through the requested version of
-            # Python.
-            if reexec:
-                try:
-                    self._ExecuteHookViaReexec(interp, context, **kwargs)
-                except OSError as e:
-                    if e.errno == errno.ENOENT:
-                        # We couldn't find the interpreter, so fallback to
-                        # importing.
-                        reexec = False
-                    else:
-                        raise
+                if prog.startswith("python2"):
+                    raise HookError("Python 2 is not supported")
 
             # Run the hook by importing directly.
-            if not reexec:
-                self._ExecuteHookViaImport(data, context, **kwargs)
+            self._ExecuteHookViaImport(data, context, **kwargs)
         finally:
             # Restore sys.path and CWD.
             sys.path = orig_syspath

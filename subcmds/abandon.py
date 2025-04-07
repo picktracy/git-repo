@@ -70,8 +70,10 @@ It is equivalent to "git branch -D <branchname>".
         else:
             args.insert(0, "'All local branches'")
 
-    def _ExecuteOne(self, all_branches, nb, project):
+    @classmethod
+    def _ExecuteOne(cls, all_branches, nb, project_idx):
         """Abandon one project."""
+        project = cls.get_parallel_context()["projects"][project_idx]
         if all_branches:
             branches = project.GetBranches()
         else:
@@ -89,7 +91,7 @@ It is equivalent to "git branch -D <branchname>".
             if status is not None:
                 ret[name] = status
 
-        return (ret, project, errors)
+        return (ret, project_idx, errors)
 
     def Execute(self, opt, args):
         nb = args[0].split()
@@ -102,7 +104,8 @@ It is equivalent to "git branch -D <branchname>".
         _RelPath = lambda p: p.RelPath(local=opt.this_manifest_only)
 
         def _ProcessResults(_pool, pm, states):
-            for results, project, errors in states:
+            for results, project_idx, errors in states:
+                project = all_projects[project_idx]
                 for branch, status in results.items():
                     if status:
                         success[branch].append(project)
@@ -111,15 +114,18 @@ It is equivalent to "git branch -D <branchname>".
                 aggregate_errors.extend(errors)
                 pm.update(msg="")
 
-        self.ExecuteInParallel(
-            opt.jobs,
-            functools.partial(self._ExecuteOne, opt.all, nb),
-            all_projects,
-            callback=_ProcessResults,
-            output=Progress(
-                "Abandon %s" % (nb,), len(all_projects), quiet=opt.quiet
-            ),
-        )
+        with self.ParallelContext():
+            self.get_parallel_context()["projects"] = all_projects
+            self.ExecuteInParallel(
+                opt.jobs,
+                functools.partial(self._ExecuteOne, opt.all, nb),
+                range(len(all_projects)),
+                callback=_ProcessResults,
+                output=Progress(
+                    f"Abandon {nb}", len(all_projects), quiet=opt.quiet
+                ),
+                chunksize=1,
+            )
 
         width = max(
             itertools.chain(
@@ -152,4 +158,4 @@ It is equivalent to "git branch -D <branchname>".
                             _RelPath(p) for p in success[br]
                         )
                     )
-                print("%s%s| %s\n" % (br, " " * (width - len(br)), result))
+                print(f"{br}{' ' * (width - len(br))}| {result}\n")

@@ -66,12 +66,12 @@ class UpdateProjectsResult(NamedTuple):
     fatal: bool
 
 
-class Superproject(object):
+class Superproject:
     """Get commit ids from superproject.
 
-    Initializes a local copy of a superproject for the manifest. This allows
-    lookup of commit ids for all projects. It contains _project_commit_ids which
-    is a dictionary with project/commit id entries.
+    Initializes a bare local copy of a superproject for the manifest. This
+    allows lookup of commit ids for all projects. It contains
+    _project_commit_ids which is a dictionary with project/commit id entries.
     """
 
     def __init__(
@@ -235,7 +235,8 @@ class Superproject(object):
         p = GitCommand(
             None,
             cmd,
-            cwd=self._work_git,
+            gitdir=self._work_git,
+            bare=True,
             capture_stdout=True,
             capture_stderr=True,
         )
@@ -271,7 +272,8 @@ class Superproject(object):
         p = GitCommand(
             None,
             cmd,
-            cwd=self._work_git,
+            gitdir=self._work_git,
+            bare=True,
             capture_stdout=True,
             capture_stderr=True,
         )
@@ -304,8 +306,6 @@ class Superproject(object):
                 self._manifest.manifestFile,
             )
             return SyncResult(False, False)
-
-        _PrintBetaNotice()
 
         should_exit = True
         if not self._remote_url:
@@ -381,7 +381,7 @@ class Superproject(object):
         try:
             with open(manifest_path, "w", encoding="utf-8") as fp:
                 fp.write(manifest_str)
-        except IOError as e:
+        except OSError as e:
             self._LogError("cannot write manifest to : {} {}", manifest_path, e)
             return None
         return manifest_path
@@ -448,16 +448,6 @@ class Superproject(object):
 
         manifest_path = self._WriteManifestFile()
         return UpdateProjectsResult(manifest_path, False)
-
-
-@functools.lru_cache(maxsize=10)
-def _PrintBetaNotice():
-    """Print the notice of beta status."""
-    print(
-        "NOTICE: --use-superproject is in beta; report any issues to the "
-        "address described in `repo version`",
-        file=sys.stderr,
-    )
 
 
 @functools.lru_cache(maxsize=None)

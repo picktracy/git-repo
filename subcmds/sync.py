@@ -21,7 +21,7 @@ import multiprocessing
 import netrc
 import optparse
 import os
-import socket
+from pathlib import Path
 import sys
 import tempfile
 import time
@@ -83,14 +83,57 @@ from wrapper import Wrapper
 
 _ONE_DAY_S = 24 * 60 * 60
 
-# Env var to implicitly turn auto-gc back on.  This was added to allow a user to
-# revert a change in default behavior in v2.29.9.  Remove after 2023-04-01.
-_REPO_AUTO_GC = "REPO_AUTO_GC"
-_AUTO_GC = os.environ.get(_REPO_AUTO_GC) == "1"
-
 _REPO_ALLOW_SHALLOW = os.environ.get("REPO_ALLOW_SHALLOW")
 
 logger = RepoLogger(__file__)
+
+
+def _SafeCheckoutOrder(checkouts: List[Project]) -> List[List[Project]]:
+    """Generate a sequence of checkouts that is safe to perform. The client
+    should checkout everything from n-th index before moving to n+1.
+
+    This is only useful if manifest contains nested projects.
+
+    E.g. if foo, foo/bar and foo/bar/baz are project paths, then foo needs to
+    finish before foo/bar can proceed, and foo/bar needs to finish before
+    foo/bar/baz."""
+    res = [[]]
+    current = res[0]
+
+    # depth_stack contains a current stack of parent paths.
+    depth_stack = []
+    # Checkouts are iterated in the hierarchical order. That way, it can easily
+    # be determined if the previous checkout is parent of the current checkout.
+    # We are splitting by the path separator so the final result is
+    # hierarchical, and not just lexicographical. For example, if the projects
+    # are: foo, foo/bar, foo-bar, lexicographical order produces foo, foo-bar
+    # and foo/bar, which doesn't work.
+    for checkout in sorted(checkouts, key=lambda x: x.relpath.split("/")):
+        checkout_path = Path(checkout.relpath)
+        while depth_stack:
+            try:
+                checkout_path.relative_to(depth_stack[-1])
+            except ValueError:
+                # Path.relative_to returns ValueError if paths are not relative.
+                # TODO(sokcevic): Switch to is_relative_to once min supported
+                # version is py3.9.
+                depth_stack.pop()
+            else:
+                if len(depth_stack) >= len(res):
+                    # Another depth created.
+                    res.append([])
+                break
+
+        current = res[len(depth_stack)]
+        current.append(checkout)
+        depth_stack.append(checkout_path)
+
+    return res
+
+
+def _chunksize(projects: int, jobs: int) -> int:
+    """Calculate chunk size for the given number of projects and jobs."""
+    return min(max(1, projects // jobs), WORKER_BATCH_SIZE)
 
 
 class _FetchOneResult(NamedTuple):
@@ -98,7 +141,7 @@ class _FetchOneResult(NamedTuple):
 
     Attributes:
       success (bool): True if successful.
-      project (Project): The fetched project.
+      project_idx (int): The fetched project index.
       start (float): The starting time.time().
       finish (float): The ending time.time().
       remote_fetched (bool): True if the remote was actually queried.
@@ -106,7 +149,7 @@ class _FetchOneResult(NamedTuple):
 
     success: bool
     errors: List[Exception]
-    project: Project
+    project_idx: int
     start: float
     finish: float
     remote_fetched: bool
@@ -139,14 +182,14 @@ class _CheckoutOneResult(NamedTuple):
 
     Attributes:
       success (bool): True if successful.
-      project (Project): The project.
+      project_idx (int): The project index.
       start (float): The starting time.time().
       finish (float): The ending time.time().
     """
 
     success: bool
     errors: List[Exception]
-    project: Project
+    project_idx: int
     start: float
     finish: float
 
@@ -186,9 +229,10 @@ class TeeStringIO(io.StringIO):
 
     def write(self, s: str) -> int:
         """Write to additional destination."""
-        super().write(s)
+        ret = super().write(s)
         if self.io is not None:
             self.io.write(s)
+        return ret
 
 
 class Sync(Command, MirrorSafeCommand):
@@ -242,6 +286,11 @@ The --force-sync option can be used to overwrite existing git
 directories if they have previously been linked to a different
 object directory. WARNING: This may cause data to be lost since
 refs may be removed when overwriting.
+
+The --force-checkout option can be used to force git to switch revs even if the
+index or the working tree differs from HEAD, and if there are untracked files.
+WARNING: This may cause data to be lost since uncommitted changes may be
+removed.
 
 The --force-remove-dirty option can be used to remove previously used
 projects with uncommitted changes. WARNING: This may cause data to be
@@ -341,12 +390,27 @@ later is required to fix a server side protocol bug.
             "may cause loss of data",
         )
         p.add_option(
+            "--force-checkout",
+            dest="force_checkout",
+            action="store_true",
+            help="force checkout even if it results in throwing away "
+            "uncommitted modifications. "
+            "WARNING: this may cause loss of data",
+        )
+        p.add_option(
             "--force-remove-dirty",
             dest="force_remove_dirty",
             action="store_true",
             help="force remove projects with uncommitted modifications if "
             "projects no longer exist in the manifest. "
             "WARNING: this may cause loss of data",
+        )
+        p.add_option(
+            "--rebase",
+            dest="rebase",
+            action="store_true",
+            help="rebase local commits regardless of whether they are "
+            "published",
         )
         p.add_option(
             "-l",
@@ -528,7 +592,8 @@ later is required to fix a server side protocol bug.
             branch = branch[len(R_HEADS) :]
         return branch
 
-    def _GetCurrentBranchOnly(self, opt, manifest):
+    @classmethod
+    def _GetCurrentBranchOnly(cls, opt, manifest):
         """Returns whether current-branch or use-superproject options are
         enabled.
 
@@ -618,7 +683,7 @@ later is required to fix a server side protocol bug.
 
             if not use_super:
                 continue
-            m.superproject.SetQuiet(opt.quiet)
+            m.superproject.SetQuiet(not opt.verbose)
             print_messages = git_superproject.PrintMessages(
                 opt.use_superproject, m
             )
@@ -646,7 +711,8 @@ later is required to fix a server side protocol bug.
         if need_unload:
             m.outer_client.manifest.Unload()
 
-    def _FetchProjectList(self, opt, projects):
+    @classmethod
+    def _FetchProjectList(cls, opt, projects):
         """Main function of the fetch worker.
 
         The projects we're given share the same underlying git object store, so
@@ -658,21 +724,23 @@ later is required to fix a server side protocol bug.
             opt: Program options returned from optparse.  See _Options().
             projects: Projects to fetch.
         """
-        return [self._FetchOne(opt, x) for x in projects]
+        return [cls._FetchOne(opt, x) for x in projects]
 
-    def _FetchOne(self, opt, project):
+    @classmethod
+    def _FetchOne(cls, opt, project_idx):
         """Fetch git objects for a single project.
 
         Args:
             opt: Program options returned from optparse.  See _Options().
-            project: Project object for the project to fetch.
+            project_idx: Project index for the project to fetch.
 
         Returns:
             Whether the fetch was successful.
         """
+        project = cls.get_parallel_context()["projects"][project_idx]
         start = time.time()
         k = f"{project.name} @ {project.relpath}"
-        self._sync_dict[k] = start
+        cls.get_parallel_context()["sync_dict"][k] = start
         success = False
         remote_fetched = False
         errors = []
@@ -682,7 +750,7 @@ later is required to fix a server side protocol bug.
                 quiet=opt.quiet,
                 verbose=opt.verbose,
                 output_redir=buf,
-                current_branch_only=self._GetCurrentBranchOnly(
+                current_branch_only=cls._GetCurrentBranchOnly(
                     opt, project.manifest
                 ),
                 force_sync=opt.force_sync,
@@ -692,7 +760,7 @@ later is required to fix a server side protocol bug.
                 optimized_fetch=opt.optimized_fetch,
                 retry_fetches=opt.retry_fetches,
                 prune=opt.prune,
-                ssh_proxy=self.ssh_proxy,
+                ssh_proxy=cls.get_parallel_context()["ssh_proxy"],
                 clone_filter=project.manifest.CloneFilter,
                 partial_clone_exclude=project.manifest.PartialCloneExclude,
                 clone_filter_for_depth=project.manifest.CloneFilterForDepth,
@@ -724,24 +792,20 @@ later is required to fix a server side protocol bug.
                 type(e).__name__,
                 e,
             )
-            del self._sync_dict[k]
             errors.append(e)
             raise
+        finally:
+            del cls.get_parallel_context()["sync_dict"][k]
 
         finish = time.time()
-        del self._sync_dict[k]
         return _FetchOneResult(
-            success, errors, project, start, finish, remote_fetched
+            success, errors, project_idx, start, finish, remote_fetched
         )
-
-    @classmethod
-    def _FetchInitChild(cls, ssh_proxy):
-        cls.ssh_proxy = ssh_proxy
 
     def _GetSyncProgressMessage(self):
         earliest_time = float("inf")
         earliest_proj = None
-        items = self._sync_dict.items()
+        items = self.get_parallel_context()["sync_dict"].items()
         for project, t in items:
             if t < earliest_time:
                 earliest_time = t
@@ -749,7 +813,7 @@ later is required to fix a server side protocol bug.
 
         if not earliest_proj:
             # This function is called when sync is still running but in some
-            # cases (by chance), _sync_dict can contain no entries. Return some
+            # cases (by chance), sync_dict can contain no entries. Return some
             # text to indicate that sync is still working.
             return "..working.."
 
@@ -757,10 +821,19 @@ later is required to fix a server side protocol bug.
         jobs = jobs_str(len(items))
         return f"{jobs} | {elapsed_str(elapsed)} {earliest_proj}"
 
+    @classmethod
+    def InitWorker(cls):
+        # Force connect to the manager server now.
+        # This is good because workers are initialized one by one. Without this,
+        # multiple workers may connect to the manager when handling the first
+        # job at the same time. Then the connection may fail if too many
+        # connections are pending and execeeded the socket listening backlog,
+        # especially on MacOS.
+        len(cls.get_parallel_context()["sync_dict"])
+
     def _Fetch(self, projects, opt, err_event, ssh_proxy, errors):
         ret = True
 
-        jobs = opt.jobs_network
         fetched = set()
         remote_fetched = set()
         pm = Progress(
@@ -772,7 +845,6 @@ later is required to fix a server side protocol bug.
             elide=True,
         )
 
-        self._sync_dict = multiprocessing.Manager().dict()
         sync_event = _threading.Event()
 
         def _MonitorSyncLoop():
@@ -783,19 +855,13 @@ later is required to fix a server side protocol bug.
 
         sync_progress_thread = _threading.Thread(target=_MonitorSyncLoop)
         sync_progress_thread.daemon = True
-        sync_progress_thread.start()
 
-        objdir_project_map = dict()
-        for project in projects:
-            objdir_project_map.setdefault(project.objdir, []).append(project)
-        projects_list = list(objdir_project_map.values())
-
-        def _ProcessResults(results_sets):
+        def _ProcessResults(pool, pm, results_sets):
             ret = True
             for results in results_sets:
                 for result in results:
                     success = result.success
-                    project = result.project
+                    project = projects[result.project_idx]
                     start = result.start
                     finish = result.finish
                     self._fetch_times.Set(project, finish - start)
@@ -819,58 +885,50 @@ later is required to fix a server side protocol bug.
                         fetched.add(project.gitdir)
                     pm.update()
                 if not ret and opt.fail_fast:
+                    if pool:
+                        pool.close()
                     break
             return ret
 
-        # We pass the ssh proxy settings via the class.  This allows
-        # multiprocessing to pickle it up when spawning children.  We can't pass
-        # it as an argument to _FetchProjectList below as multiprocessing is
-        # unable to pickle those.
-        Sync.ssh_proxy = None
+        with self.ParallelContext():
+            self.get_parallel_context()["projects"] = projects
+            self.get_parallel_context()[
+                "sync_dict"
+            ] = multiprocessing.Manager().dict()
 
-        # NB: Multiprocessing is heavy, so don't spin it up for one job.
-        if len(projects_list) == 1 or jobs == 1:
-            self._FetchInitChild(ssh_proxy)
-            if not _ProcessResults(
-                self._FetchProjectList(opt, x) for x in projects_list
-            ):
-                ret = False
-        else:
-            # Favor throughput over responsiveness when quiet.  It seems that
-            # imap() will yield results in batches relative to chunksize, so
-            # even as the children finish a sync, we won't see the result until
-            # one child finishes ~chunksize jobs.  When using a large --jobs
-            # with large chunksize, this can be jarring as there will be a large
-            # initial delay where repo looks like it isn't doing anything and
-            # sits at 0%, but then suddenly completes a lot of jobs all at once.
-            # Since this code is more network bound, we can accept a bit more
-            # CPU overhead with a smaller chunksize so that the user sees more
-            # immediate & continuous feedback.
-            if opt.quiet:
-                chunksize = WORKER_BATCH_SIZE
-            else:
+            objdir_project_map = dict()
+            for index, project in enumerate(projects):
+                objdir_project_map.setdefault(project.objdir, []).append(index)
+            projects_list = list(objdir_project_map.values())
+
+            jobs = max(1, min(opt.jobs_network, len(projects_list)))
+
+            # We pass the ssh proxy settings via the class.  This allows
+            # multiprocessing to pickle it up when spawning children.  We can't
+            # pass it as an argument to _FetchProjectList below as
+            # multiprocessing is unable to pickle those.
+            self.get_parallel_context()["ssh_proxy"] = ssh_proxy
+
+            sync_progress_thread.start()
+            if not opt.quiet:
                 pm.update(inc=0, msg="warming up")
-                chunksize = 4
-            with multiprocessing.Pool(
-                jobs, initializer=self._FetchInitChild, initargs=(ssh_proxy,)
-            ) as pool:
-                results = pool.imap_unordered(
+            try:
+                ret = self.ExecuteInParallel(
+                    jobs,
                     functools.partial(self._FetchProjectList, opt),
                     projects_list,
-                    chunksize=chunksize,
+                    callback=_ProcessResults,
+                    output=pm,
+                    # Use chunksize=1 to avoid the chance that some workers are
+                    # idle while other workers still have more than one job in
+                    # their chunk queue.
+                    chunksize=1,
+                    initializer=self.InitWorker,
                 )
-                if not _ProcessResults(results):
-                    ret = False
-                    pool.close()
+            finally:
+                sync_event.set()
+                sync_progress_thread.join()
 
-        # Cleanup the reference now that we're done with it, and we're going to
-        # release any resources it points to.  If we don't, later
-        # multiprocessing usage (e.g. checkouts) will try to pickle and then
-        # crash.
-        del Sync.ssh_proxy
-
-        sync_event.set()
-        pm.end()
         self._fetch_times.Save()
         self._local_sync_state.Save()
 
@@ -911,7 +969,9 @@ later is required to fix a server side protocol bug.
         if not success:
             err_event.set()
 
-        _PostRepoFetch(rp, opt.repo_verify)
+        # Call self update, unless requested not to
+        if os.environ.get("REPO_SKIP_SELF_UPDATE", "0") == "0":
+            _PostRepoFetch(rp, opt.repo_verify)
         if opt.network_only:
             # Bail out now; the rest touches the working tree.
             if err_event.is_set():
@@ -943,7 +1003,7 @@ later is required to fix a server side protocol bug.
                 break
             # Stop us from non-stopped fetching actually-missing repos: If set
             # of missing repos has not been changed from last fetch, we break.
-            missing_set = set(p.name for p in missing)
+            missing_set = {p.name for p in missing}
             if previously_missing_set == missing_set:
                 break
             previously_missing_set = missing_set
@@ -956,17 +1016,32 @@ later is required to fix a server side protocol bug.
 
         return _FetchMainResult(all_projects)
 
-    def _CheckoutOne(self, detach_head, force_sync, project):
+    @classmethod
+    def _CheckoutOne(
+        cls,
+        detach_head,
+        force_sync,
+        force_checkout,
+        force_rebase,
+        verbose,
+        project_idx,
+    ):
         """Checkout work tree for one project
 
         Args:
             detach_head: Whether to leave a detached HEAD.
-            force_sync: Force checking out of the repo.
-            project: Project object for the project to checkout.
+            force_sync: Force checking out of .git directory (e.g. overwrite
+            existing git directory that was previously linked to a different
+            object directory).
+            force_checkout: Force checking out of the repo content.
+            force_rebase: Force rebase.
+            verbose: Whether to show verbose messages.
+            project_idx: Project index for the project to checkout.
 
         Returns:
             Whether the fetch was successful.
         """
+        project = cls.get_parallel_context()["projects"][project_idx]
         start = time.time()
         syncbuf = SyncBuffer(
             project.manifest.manifestProject.config, detach_head=detach_head
@@ -975,9 +1050,16 @@ later is required to fix a server side protocol bug.
         errors = []
         try:
             project.Sync_LocalHalf(
-                syncbuf, force_sync=force_sync, errors=errors
+                syncbuf,
+                force_sync=force_sync,
+                force_checkout=force_checkout,
+                force_rebase=force_rebase,
+                errors=errors,
+                verbose=verbose,
             )
             success = syncbuf.Finish()
+        except KeyboardInterrupt:
+            logger.error("Keyboard interrupt while processing %s", project.name)
         except GitError as e:
             logger.error(
                 "error.GitError: Cannot checkout %s: %s", project.name, e
@@ -995,7 +1077,7 @@ later is required to fix a server side protocol bug.
         if not success:
             logger.error("error: Cannot checkout %s", project.name)
         finish = time.time()
-        return _CheckoutOneResult(success, errors, project, start, finish)
+        return _CheckoutOneResult(success, errors, project_idx, start, finish)
 
     def _Checkout(self, all_projects, opt, err_results, checkout_errors):
         """Checkout projects listed in all_projects
@@ -1013,7 +1095,9 @@ later is required to fix a server side protocol bug.
             ret = True
             for result in results:
                 success = result.success
-                project = result.project
+                project = self.get_parallel_context()["projects"][
+                    result.project_idx
+                ]
                 start = result.start
                 finish = result.finish
                 self.event_log.AddSync(
@@ -1039,15 +1123,29 @@ later is required to fix a server side protocol bug.
                 pm.update(msg=project.name)
             return ret
 
-        proc_res = self.ExecuteInParallel(
-            opt.jobs_checkout,
-            functools.partial(
-                self._CheckoutOne, opt.detach_head, opt.force_sync
-            ),
-            all_projects,
-            callback=_ProcessResults,
-            output=Progress("Checking out", len(all_projects), quiet=opt.quiet),
-        )
+        for projects in _SafeCheckoutOrder(all_projects):
+            with self.ParallelContext():
+                self.get_parallel_context()["projects"] = projects
+                proc_res = self.ExecuteInParallel(
+                    opt.jobs_checkout,
+                    functools.partial(
+                        self._CheckoutOne,
+                        opt.detach_head,
+                        opt.force_sync,
+                        opt.force_checkout,
+                        opt.rebase,
+                        opt.verbose,
+                    ),
+                    range(len(projects)),
+                    callback=_ProcessResults,
+                    output=Progress(
+                        "Checking out", len(all_projects), quiet=opt.quiet
+                    ),
+                    # Use chunksize=1 to avoid the chance that some workers are
+                    # idle while other workers still have more than one job in
+                    # their chunk queue.
+                    chunksize=1,
+                )
 
         self._local_sync_state.Save()
         return proc_res and not err_results
@@ -1130,8 +1228,6 @@ later is required to fix a server side protocol bug.
                     )
                     project.config.SetString("gc.pruneExpire", "never")
             else:
-                if not opt.quiet:
-                    print(f"\r{relpath}: not shared, disabling pruning.")
                 project.config.SetString("extensions.preciousObjects", None)
                 project.config.SetString("gc.pruneExpire", None)
 
@@ -1265,7 +1361,7 @@ later is required to fix a server side protocol bug.
         old_project_paths = []
 
         if os.path.exists(file_path):
-            with open(file_path, "r") as fd:
+            with open(file_path) as fd:
                 old_project_paths = fd.read().split("\n")
             # In reversed order, so subfolders are deleted before parent folder.
             for path in sorted(old_project_paths, reverse=True):
@@ -1290,7 +1386,7 @@ later is required to fix a server side protocol bug.
                             groups=None,
                         )
                         project.DeleteWorktree(
-                            quiet=opt.quiet, force=opt.force_remove_dirty
+                            verbose=opt.verbose, force=opt.force_remove_dirty
                         )
 
         new_project_paths.sort()
@@ -1348,7 +1444,10 @@ later is required to fix a server side protocol bug.
             for need_remove_file in need_remove_files:
                 # Try to remove the updated copyfile or linkfile.
                 # So, if the file is not exist, nothing need to do.
-                platform_utils.remove(need_remove_file, missing_ok=True)
+                platform_utils.remove(
+                    os.path.join(self.client.topdir, need_remove_file),
+                    missing_ok=True,
+                )
 
         # Create copy-link-files.json, save dest path of "copyfile" and
         # "linkfile".
@@ -1376,7 +1475,7 @@ later is required to fix a server side protocol bug.
             else:
                 try:
                     info = netrc.netrc()
-                except IOError:
+                except OSError:
                     # .netrc file does not exist or could not be opened.
                     pass
                 else:
@@ -1396,13 +1495,14 @@ later is required to fix a server side protocol bug.
 
             if username and password:
                 manifest_server = manifest_server.replace(
-                    "://", "://%s:%s@" % (username, password), 1
+                    "://", f"://{username}:{password}@", 1
                 )
 
         transport = PersistentTransport(manifest_server)
         if manifest_server.startswith("persistent-"):
             manifest_server = manifest_server[len("persistent-") :]
 
+        # Changes in behavior should update docs/smart-sync.md accordingly.
         try:
             server = xmlrpc.client.Server(manifest_server, transport=transport)
             if opt.smart_sync:
@@ -1410,6 +1510,19 @@ later is required to fix a server side protocol bug.
 
                 if "SYNC_TARGET" in os.environ:
                     target = os.environ["SYNC_TARGET"]
+                    [success, manifest_str] = server.GetApprovedManifest(
+                        branch, target
+                    )
+                elif (
+                    "TARGET_PRODUCT" in os.environ
+                    and "TARGET_BUILD_VARIANT" in os.environ
+                    and "TARGET_RELEASE" in os.environ
+                ):
+                    target = "%s-%s-%s" % (
+                        os.environ["TARGET_PRODUCT"],
+                        os.environ["TARGET_RELEASE"],
+                        os.environ["TARGET_BUILD_VARIANT"],
+                    )
                     [success, manifest_str] = server.GetApprovedManifest(
                         branch, target
                     )
@@ -1435,7 +1548,7 @@ later is required to fix a server side protocol bug.
                 try:
                     with open(smart_sync_manifest_path, "w") as f:
                         f.write(manifest_str)
-                except IOError as e:
+                except OSError as e:
                     raise SmartSyncError(
                         "error: cannot write manifest to %s:\n%s"
                         % (smart_sync_manifest_path, e),
@@ -1446,7 +1559,7 @@ later is required to fix a server side protocol bug.
                 raise SmartSyncError(
                     "error: manifest server RPC call failed: %s" % manifest_str
                 )
-        except (socket.error, IOError, xmlrpc.client.Fault) as e:
+        except (OSError, xmlrpc.client.Fault) as e:
             raise SmartSyncError(
                 "error: cannot connect to manifest server %s:\n%s"
                 % (manifest.manifest_server, e),
@@ -1502,7 +1615,7 @@ later is required to fix a server side protocol bug.
             buf = TeeStringIO(sys.stdout)
             try:
                 result = mp.Sync_NetworkHalf(
-                    quiet=opt.quiet,
+                    quiet=not opt.verbose,
                     output_redir=buf,
                     verbose=opt.verbose,
                     current_branch_only=self._GetCurrentBranchOnly(
@@ -1535,16 +1648,17 @@ later is required to fix a server side protocol bug.
             syncbuf = SyncBuffer(mp.config)
             start = time.time()
             mp.Sync_LocalHalf(
-                syncbuf, submodules=mp.manifest.HasSubmodules, errors=errors
+                syncbuf,
+                submodules=mp.manifest.HasSubmodules,
+                errors=errors,
+                verbose=opt.verbose,
             )
             clean = syncbuf.Finish()
             self.event_log.AddSync(
                 mp, event_log.TASK_SYNC_LOCAL, start, time.time(), clean
             )
             if not clean:
-                raise UpdateManifestError(
-                    aggregate_errors=errors, project=mp.name
-                )
+                raise UpdateManifestError(aggregate_errors=errors)
             self._ReloadManifest(manifest_name, mp.manifest)
 
     def ValidateOptions(self, opt, args):
@@ -1574,16 +1688,6 @@ later is required to fix a server side protocol bug.
 
         if opt.prune is None:
             opt.prune = True
-
-        if opt.auto_gc is None and _AUTO_GC:
-            logger.error(
-                "Will run `git gc --auto` because %s is set. %s is deprecated "
-                "and will be removed in a future release.  Use `--auto-gc` "
-                "instead.",
-                _REPO_AUTO_GC,
-                _REPO_AUTO_GC,
-            )
-            opt.auto_gc = True
 
     def _ValidateOptionsWithManifest(self, opt, mp):
         """Like ValidateOptions, but after we've updated the manifest.
@@ -1628,7 +1732,7 @@ later is required to fix a server side protocol bug.
         errors = []
         try:
             self._ExecuteHelper(opt, args, errors)
-        except RepoExitError:
+        except (RepoExitError, RepoChangedException):
             raise
         except (KeyboardInterrupt, Exception) as e:
             raise RepoUnhandledExceptionError(e, aggregate_errors=errors)
@@ -1779,7 +1883,6 @@ later is required to fix a server side protocol bug.
                     logger.error("error: Local checkouts *not* updated.")
                     raise SyncFailFastError(aggregate_errors=errors)
 
-            err_update_linkfiles = False
             try:
                 self.UpdateCopyLinkfileList(m)
             except Exception as e:
@@ -1877,7 +1980,7 @@ def _PostRepoUpgrade(manifest, quiet=False):
 
 def _PostRepoFetch(rp, repo_verify=True, verbose=False):
     if rp.HasChanges:
-        logger.warn("info: A new version of repo is available")
+        logger.warning("info: A new version of repo is available")
         wrapper = Wrapper()
         try:
             rev = rp.bare_git.describe(rp.GetRevisionId())
@@ -1896,6 +1999,8 @@ def _PostRepoFetch(rp, repo_verify=True, verbose=False):
             # We also have to make sure this will switch to an older commit if
             # that's the latest tag in order to support release rollback.
             try:
+                # Refresh index since reset --keep won't do it.
+                rp.work_git.update_index("-q", "--refresh")
                 rp.work_git.reset("--keep", new_rev)
             except GitError as e:
                 raise RepoUnhandledExceptionError(e)
@@ -1905,10 +2010,10 @@ def _PostRepoFetch(rp, repo_verify=True, verbose=False):
             logger.warning("warning: Skipped upgrade to unverified version")
     else:
         if verbose:
-            print("repo version %s is current", rp.work_git.describe(HEAD))
+            print("repo version %s is current" % rp.work_git.describe(HEAD))
 
 
-class _FetchTimes(object):
+class _FetchTimes:
     _ALPHA = 0.5
 
     def __init__(self, manifest):
@@ -1931,7 +2036,7 @@ class _FetchTimes(object):
             try:
                 with open(self._path) as f:
                     self._saved = json.load(f)
-            except (IOError, ValueError):
+            except (OSError, ValueError):
                 platform_utils.remove(self._path, missing_ok=True)
                 self._saved = {}
 
@@ -1947,11 +2052,11 @@ class _FetchTimes(object):
         try:
             with open(self._path, "w") as f:
                 json.dump(self._seen, f, indent=2)
-        except (IOError, TypeError):
+        except (OSError, TypeError):
             platform_utils.remove(self._path, missing_ok=True)
 
 
-class LocalSyncState(object):
+class LocalSyncState:
     _LAST_FETCH = "last_fetch"
     _LAST_CHECKOUT = "last_checkout"
 
@@ -1994,7 +2099,7 @@ class LocalSyncState(object):
             try:
                 with open(self._path) as f:
                     self._state = json.load(f)
-            except (IOError, ValueError):
+            except (OSError, ValueError):
                 platform_utils.remove(self._path, missing_ok=True)
                 self._state = {}
 
@@ -2004,7 +2109,7 @@ class LocalSyncState(object):
         try:
             with open(self._path, "w") as f:
                 json.dump(self._state, f, indent=2)
-        except (IOError, TypeError):
+        except (OSError, TypeError):
             platform_utils.remove(self._path, missing_ok=True)
 
     def PruneRemovedProjects(self):
@@ -2014,7 +2119,7 @@ class LocalSyncState(object):
         delete = set()
         for path in self._state:
             gitdir = os.path.join(self._manifest.topdir, path, ".git")
-            if not os.path.exists(gitdir):
+            if not os.path.exists(gitdir) or os.path.islink(gitdir):
                 delete.add(path)
         if not delete:
             return
@@ -2046,6 +2151,7 @@ class LocalSyncState(object):
 # is passed during initialization.
 class PersistentTransport(xmlrpc.client.Transport):
     def __init__(self, orig_host):
+        super().__init__()
         self.orig_host = orig_host
 
     def request(self, host, handler, request_body, verbose=False):
@@ -2137,7 +2243,7 @@ class PersistentTransport(xmlrpc.client.Transport):
             try:
                 p.feed(data)
             except xml.parsers.expat.ExpatError as e:
-                raise IOError(
+                raise OSError(
                     f"Parsing the manifest failed: {e}\n"
                     f"Please report this to your manifest server admin.\n"
                     f'Here is the full response:\n{data.decode("utf-8")}'

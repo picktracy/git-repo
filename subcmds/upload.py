@@ -72,16 +72,16 @@ def _VerifyPendingCommits(branches: List[ReviewableBranch]) -> bool:
     # If any branch has many commits, prompt the user.
     if many_commits:
         if len(branches) > 1:
-            logger.warn(
+            logger.warning(
                 "ATTENTION: One or more branches has an unusually high number "
                 "of commits."
             )
         else:
-            logger.warn(
+            logger.warning(
                 "ATTENTION: You are uploading an unusually high number of "
                 "commits."
             )
-        logger.warn(
+        logger.warning(
             "YOU PROBABLY DO NOT MEAN TO DO THIS. (Did you rebase across "
             "branches?)"
         )
@@ -218,9 +218,14 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
     def _Options(self, p):
         p.add_option(
             "-t",
+            "--topic-branch",
             dest="auto_topic",
             action="store_true",
-            help="send local branch name to Gerrit Code Review",
+            help="set the topic to the local branch name",
+        )
+        p.add_option(
+            "--topic",
+            help="set topic for the change",
         )
         p.add_option(
             "--hashtag",
@@ -243,6 +248,12 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
             action="append",
             default=[],
             help="add a label when uploading",
+        )
+        p.add_option(
+            "--pd",
+            "--patchset-description",
+            dest="patchset_description",
+            help="description for patchset",
         )
         p.add_option(
             "--re",
@@ -543,42 +554,14 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
         people = copy.deepcopy(original_people)
         self._AppendAutoList(branch, people)
 
-        # Check if there are local changes that may have been forgotten.
-        changes = branch.project.UncommitedFiles()
-        if opt.ignore_untracked_files:
-            untracked = set(branch.project.UntrackedFiles())
-            changes = [x for x in changes if x not in untracked]
-
-        if changes:
-            key = "review.%s.autoupload" % branch.project.remote.review
-            answer = branch.project.config.GetBoolean(key)
-
-            # If they want to auto upload, let's not ask because it
-            # could be automated.
-            if answer is None:
-                print()
-                print(
-                    "Uncommitted changes in %s (did you forget to "
-                    "amend?):" % branch.project.name
-                )
-                print("\n".join(changes))
-                print("Continue uploading? (y/N) ", end="", flush=True)
-                if opt.yes:
-                    print("<--yes>")
-                    a = "yes"
-                else:
-                    a = sys.stdin.readline().strip().lower()
-                if a not in ("y", "yes", "t", "true", "on"):
-                    print("skipping upload", file=sys.stderr)
-                    branch.uploaded = False
-                    branch.error = "User aborted"
-                    return
-
         # Check if topic branches should be sent to the server during
         # upload.
-        if opt.auto_topic is not True:
-            key = "review.%s.uploadtopic" % branch.project.remote.review
-            opt.auto_topic = branch.project.config.GetBoolean(key)
+        if opt.topic is None:
+            if opt.auto_topic is not True:
+                key = "review.%s.uploadtopic" % branch.project.remote.review
+                opt.auto_topic = branch.project.config.GetBoolean(key)
+            if opt.auto_topic:
+                opt.topic = branch.name
 
         def _ExpandCommaList(value):
             """Split |value| up into comma delimited entries."""
@@ -620,19 +603,22 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
             full_dest = destination
             if not full_dest.startswith(R_HEADS):
                 full_dest = R_HEADS + full_dest
+            full_revision = branch.project.revisionExpr
+            if not full_revision.startswith(R_HEADS):
+                full_revision = R_HEADS + full_revision
 
             # If the merge branch of the local branch is different from
             # the project's revision AND destination, this might not be
             # intentional.
             if (
                 merge_branch
-                and merge_branch != branch.project.revisionExpr
+                and merge_branch != full_revision
                 and merge_branch != full_dest
             ):
                 print(
                     f"For local branch {branch.name}: merge branch "
                     f"{merge_branch} does not match destination branch "
-                    f"{destination}"
+                    f"{destination} and revision {branch.project.revisionExpr}"
                 )
                 print("skipping upload.")
                 print(
@@ -645,7 +631,7 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
         branch.UploadForReview(
             people,
             dryrun=opt.dryrun,
-            auto_topic=opt.auto_topic,
+            topic=opt.topic,
             hashtags=hashtags,
             labels=labels,
             private=opt.private,
@@ -655,6 +641,7 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
             dest_branch=destination,
             validate_certs=opt.validate_certs,
             push_options=opt.push_options,
+            patchset_description=opt.patchset_description,
         )
 
         branch.uploaded = True
@@ -729,16 +716,17 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
         merge_branch = p.stdout.strip()
         return merge_branch
 
-    @staticmethod
-    def _GatherOne(opt, project):
+    @classmethod
+    def _GatherOne(cls, opt, project_idx):
         """Figure out the upload status for |project|."""
+        project = cls.get_parallel_context()["projects"][project_idx]
         if opt.current_branch:
             cbr = project.CurrentBranch
             up_branch = project.GetUploadableBranch(cbr)
             avail = [up_branch] if up_branch else None
         else:
             avail = project.GetUploadableBranches(opt.branch)
-        return (project, avail)
+        return (project_idx, avail)
 
     def Execute(self, opt, args):
         projects = self.GetProjects(
@@ -748,7 +736,8 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
         def _ProcessResults(_pool, _out, results):
             pending = []
             for result in results:
-                project, avail = result
+                project_idx, avail = result
+                project = projects[project_idx]
                 if avail is None:
                     logger.error(
                         'repo: error: %s: Unable to upload branch "%s". '
@@ -759,15 +748,17 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
                         project.manifest.branch,
                     )
                 elif avail:
-                    pending.append(result)
+                    pending.append((project, avail))
             return pending
 
-        pending = self.ExecuteInParallel(
-            opt.jobs,
-            functools.partial(self._GatherOne, opt),
-            projects,
-            callback=_ProcessResults,
-        )
+        with self.ParallelContext():
+            self.get_parallel_context()["projects"] = projects
+            pending = self.ExecuteInParallel(
+                opt.jobs,
+                functools.partial(self._GatherOne, opt),
+                range(len(projects)),
+                callback=_ProcessResults,
+            )
 
         if not pending:
             if opt.branch is None:

@@ -52,11 +52,11 @@ def duration_str(total):
     uses microsecond resolution.  This makes for noisy output.
     """
     hours, mins, secs = convert_to_hms(total)
-    ret = "%.3fs" % (secs,)
+    ret = f"{secs:.3f}s"
     if mins:
-        ret = "%im%s" % (mins, ret)
+        ret = f"{mins}m{ret}"
     if hours:
-        ret = "%ih%s" % (hours, ret)
+        ret = f"{hours}h{ret}"
     return ret
 
 
@@ -82,7 +82,7 @@ def jobs_str(total):
     return f"{total} job{'s' if total > 1 else ''}"
 
 
-class Progress(object):
+class Progress:
     def __init__(
         self,
         title,
@@ -100,6 +100,7 @@ class Progress(object):
         self._show = not delay
         self._units = units
         self._elide = elide and _TTY
+        self._quiet = quiet
 
         # Only show the active jobs section if we run more than one in parallel.
         self._show_jobs = False
@@ -114,13 +115,7 @@ class Progress(object):
         )
         self._update_thread.daemon = True
 
-        # When quiet, never show any output.  It's a bit hacky, but reusing the
-        # existing logic that delays initial output keeps the rest of the class
-        # clean.  Basically we set the start time to years in the future.
-        if quiet:
-            self._show = False
-            self._start += 2**32
-        elif show_elapsed:
+        if not quiet and show_elapsed:
             self._update_thread.start()
 
     def _update_loop(self):
@@ -160,7 +155,7 @@ class Progress(object):
             msg = self._last_msg
         self._last_msg = msg
 
-        if not _TTY or IsTraceToStderr():
+        if not _TTY or IsTraceToStderr() or self._quiet:
             return
 
         elapsed_sec = time.time() - self._start
@@ -202,7 +197,7 @@ class Progress(object):
 
     def end(self):
         self._update_event.set()
-        if not _TTY or IsTraceToStderr() or not self._show:
+        if not _TTY or IsTraceToStderr() or self._quiet:
             return
 
         duration = duration_str(time.time() - self._start)

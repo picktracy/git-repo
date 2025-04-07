@@ -198,13 +198,13 @@ class ValueTests(unittest.TestCase):
     def test_bool_true(self):
         """Check XmlBool true values."""
         for value in ("yes", "true", "1"):
-            node = self._get_node('<node a="%s"/>' % (value,))
+            node = self._get_node(f'<node a="{value}"/>')
             self.assertTrue(manifest_xml.XmlBool(node, "a"))
 
     def test_bool_false(self):
         """Check XmlBool false values."""
         for value in ("no", "false", "0"):
-            node = self._get_node('<node a="%s"/>' % (value,))
+            node = self._get_node(f'<node a="{value}"/>')
             self.assertFalse(manifest_xml.XmlBool(node, "a"))
 
     def test_int_default(self):
@@ -220,7 +220,7 @@ class ValueTests(unittest.TestCase):
     def test_int_good(self):
         """Check XmlInt numeric handling."""
         for value in (-1, 0, 1, 50000):
-            node = self._get_node('<node a="%s"/>' % (value,))
+            node = self._get_node(f'<node a="{value}"/>')
             self.assertEqual(value, manifest_xml.XmlInt(node, "a"))
 
     def test_int_invalid(self):
@@ -384,6 +384,21 @@ class XmlManifestTests(ManifestParseTestCase):
             "</remote>"
             "</manifest>",
         )
+
+    def test_parse_with_xml_doctype(self):
+        """Check correct manifest parse with DOCTYPE node present."""
+        manifest = self.getXmlManifest(
+            """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE manifest []>
+<manifest>
+  <remote name="test-remote" fetch="http://localhost" />
+  <default remote="test-remote" revision="refs/heads/main" />
+  <project name="test-project" path="src/test-project"/>
+</manifest>
+"""
+        )
+        self.assertEqual(len(manifest.projects), 1)
+        self.assertEqual(manifest.projects[0].name, "test-project")
 
 
 class IncludeElementTests(ManifestParseTestCase):
@@ -1034,6 +1049,91 @@ class RemoveProjectElementTests(ManifestParseTestCase):
         self.assertTrue(found_proj1_path1)
         self.assertTrue(found_proj2)
 
+    def test_base_revision_checks_on_patching(self):
+        manifest_fail_wrong_tag = self.getXmlManifest(
+            """
+<manifest>
+  <remote name="default-remote" fetch="http://localhost" />
+  <default remote="default-remote" revision="tag.002" />
+  <project name="project1" path="tests/path1" />
+  <extend-project name="project1" revision="new_hash" base-rev="tag.001" />
+</manifest>
+"""
+        )
+        with self.assertRaises(error.ManifestParseError):
+            manifest_fail_wrong_tag.ToXml()
+
+        manifest_fail_remove = self.getXmlManifest(
+            """
+<manifest>
+  <remote name="default-remote" fetch="http://localhost" />
+  <default remote="default-remote" revision="refs/heads/main" />
+  <project name="project1" path="tests/path1" revision="hash1" />
+  <remove-project name="project1" base-rev="wrong_hash" />
+</manifest>
+"""
+        )
+        with self.assertRaises(error.ManifestParseError):
+            manifest_fail_remove.ToXml()
+
+        manifest_fail_extend = self.getXmlManifest(
+            """
+<manifest>
+  <remote name="default-remote" fetch="http://localhost" />
+  <default remote="default-remote" revision="refs/heads/main" />
+  <project name="project1" path="tests/path1" revision="hash1" />
+  <extend-project name="project1" revision="new_hash" base-rev="wrong_hash" />
+</manifest>
+"""
+        )
+        with self.assertRaises(error.ManifestParseError):
+            manifest_fail_extend.ToXml()
+
+        manifest_fail_unknown = self.getXmlManifest(
+            """
+<manifest>
+  <remote name="default-remote" fetch="http://localhost" />
+  <default remote="default-remote" revision="refs/heads/main" />
+  <project name="project1" path="tests/path1" />
+  <extend-project name="project1" revision="new_hash" base-rev="any_hash" />
+</manifest>
+"""
+        )
+        with self.assertRaises(error.ManifestParseError):
+            manifest_fail_unknown.ToXml()
+
+        manifest_ok = self.getXmlManifest(
+            """
+<manifest>
+  <remote name="default-remote" fetch="http://localhost" />
+  <default remote="default-remote" revision="refs/heads/main" />
+  <project name="project1" path="tests/path1" revision="hash1" />
+  <project name="project2" path="tests/path2" revision="hash2" />
+  <project name="project3" path="tests/path3" revision="hash3" />
+  <project name="project4" path="tests/path4" revision="hash4" />
+
+  <remove-project name="project1" />
+  <remove-project name="project2" base-rev="hash2" />
+  <project name="project2" path="tests/path2" revision="new_hash2" />
+  <extend-project name="project3" base-rev="hash3" revision="new_hash3" />
+  <extend-project name="project3" base-rev="new_hash3" revision="newer_hash3" />
+  <remove-project path="tests/path4" base-rev="hash4" />
+</manifest>
+"""
+        )
+        found_proj2 = False
+        found_proj3 = False
+        for proj in manifest_ok.projects:
+            if proj.name == "project2":
+                found_proj2 = True
+            if proj.name == "project3":
+                found_proj3 = True
+            self.assertNotEqual(proj.name, "project1")
+            self.assertNotEqual(proj.name, "project4")
+        self.assertTrue(found_proj2)
+        self.assertTrue(found_proj3)
+        self.assertTrue(len(manifest_ok.projects) == 2)
+
 
 class ExtendProjectElementTests(ManifestParseTestCase):
     """Tests for <extend-project>."""
@@ -1113,3 +1213,79 @@ class ExtendProjectElementTests(ManifestParseTestCase):
         )
         self.assertEqual(len(manifest.projects), 1)
         self.assertEqual(manifest.projects[0].upstream, "bar")
+
+
+class NormalizeUrlTests(ManifestParseTestCase):
+    """Tests for normalize_url() in manifest_xml.py"""
+
+    def test_has_trailing_slash(self):
+        url = "http://foo.com/bar/baz/"
+        self.assertEqual(
+            "http://foo.com/bar/baz", manifest_xml.normalize_url(url)
+        )
+
+        url = "http://foo.com/bar/"
+        self.assertEqual("http://foo.com/bar", manifest_xml.normalize_url(url))
+
+    def test_has_leading_slash(self):
+        """SCP-like syntax except a / comes before the : which git disallows."""
+        url = "/git@foo.com:bar/baf"
+        self.assertEqual(url, manifest_xml.normalize_url(url))
+
+        url = "gi/t@foo.com:bar/baf"
+        self.assertEqual(url, manifest_xml.normalize_url(url))
+
+        url = "git@fo/o.com:bar/baf"
+        self.assertEqual(url, manifest_xml.normalize_url(url))
+
+    def test_has_no_scheme(self):
+        """Deal with cases where we have no scheme, but we also
+        aren't dealing with the git SCP-like syntax
+        """
+        url = "foo.com/baf/bat"
+        self.assertEqual(url, manifest_xml.normalize_url(url))
+
+        url = "foo.com/baf"
+        self.assertEqual(url, manifest_xml.normalize_url(url))
+
+        url = "git@foo.com/baf/bat"
+        self.assertEqual(url, manifest_xml.normalize_url(url))
+
+        url = "git@foo.com/baf"
+        self.assertEqual(url, manifest_xml.normalize_url(url))
+
+        url = "/file/path/here"
+        self.assertEqual(url, manifest_xml.normalize_url(url))
+
+    def test_has_no_scheme_matches_scp_like_syntax(self):
+        url = "git@foo.com:bar/baf"
+        self.assertEqual(
+            "ssh://git@foo.com/bar/baf", manifest_xml.normalize_url(url)
+        )
+
+        url = "git@foo.com:bar/"
+        self.assertEqual(
+            "ssh://git@foo.com/bar", manifest_xml.normalize_url(url)
+        )
+
+    def test_remote_url_resolution(self):
+        remote = manifest_xml._XmlRemote(
+            name="foo",
+            fetch="git@github.com:org2/",
+            manifestUrl="git@github.com:org2/custom_manifest.git",
+        )
+        self.assertEqual("ssh://git@github.com/org2", remote.resolvedFetchUrl)
+
+        remote = manifest_xml._XmlRemote(
+            name="foo",
+            fetch="ssh://git@github.com/org2/",
+            manifestUrl="git@github.com:org2/custom_manifest.git",
+        )
+        self.assertEqual("ssh://git@github.com/org2", remote.resolvedFetchUrl)
+
+        remote = manifest_xml._XmlRemote(
+            name="foo",
+            fetch="git@github.com:org2/",
+            manifestUrl="ssh://git@github.com/org2/custom_manifest.git",
+        )
+        self.assertEqual("ssh://git@github.com/org2", remote.resolvedFetchUrl)

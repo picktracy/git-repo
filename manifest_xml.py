@@ -114,12 +114,40 @@ def XmlInt(node, attr, default=None):
     try:
         return int(value)
     except ValueError:
-        raise ManifestParseError(
-            'manifest: invalid %s="%s" integer' % (attr, value)
-        )
+        raise ManifestParseError(f'manifest: invalid {attr}="{value}" integer')
 
 
-class _Default(object):
+def normalize_url(url: str) -> str:
+    """Mutate input 'url' into normalized form:
+
+    * remove trailing slashes
+    * convert SCP-like syntax to SSH URL
+
+    Args:
+        url: URL to modify
+
+    Returns:
+        The normalized URL.
+    """
+
+    url = url.rstrip("/")
+    parsed_url = urllib.parse.urlparse(url)
+
+    # This matches patterns like "git@github.com:foo".
+    scp_like_url_re = r"^[^/:]+@[^/:]+:[^/]+"
+
+    # If our URL is missing a schema and matches git's
+    # SCP-like syntax we should convert it to a proper
+    # SSH URL instead to make urljoin() happier.
+    #
+    # See: https://git-scm.com/docs/git-clone#URLS
+    if not parsed_url.scheme and re.match(scp_like_url_re, url):
+        return "ssh://" + url.replace(":", "/", 1)
+
+    return url
+
+
+class _Default:
     """Project defaults within the manifest."""
 
     revisionExpr = None
@@ -142,7 +170,7 @@ class _Default(object):
         return self.__dict__ != other.__dict__
 
 
-class _XmlRemote(object):
+class _XmlRemote:
     def __init__(
         self,
         name,
@@ -182,20 +210,22 @@ class _XmlRemote(object):
     def _resolveFetchUrl(self):
         if self.fetchUrl is None:
             return ""
-        url = self.fetchUrl.rstrip("/")
-        manifestUrl = self.manifestUrl.rstrip("/")
-        # urljoin will gets confused over quite a few things.  The ones we care
-        # about here are:
-        # * no scheme in the base url, like <hostname:port>
-        # We handle no scheme by replacing it with an obscure protocol, gopher
-        # and then replacing it with the original when we are done.
 
-        if manifestUrl.find(":") != manifestUrl.find("/") - 1:
-            url = urllib.parse.urljoin("gopher://" + manifestUrl, url)
-            url = re.sub(r"^gopher://", "", url)
+        fetch_url = normalize_url(self.fetchUrl)
+        manifest_url = normalize_url(self.manifestUrl)
+
+        # urljoin doesn't like URLs with no scheme in the base URL
+        # such as file paths.  We handle this by prefixing it with
+        # an obscure protocol, gopher, and replacing it with the
+        # original after urljoin
+        if manifest_url.find(":") != manifest_url.find("/") - 1:
+            fetch_url = urllib.parse.urljoin(
+                "gopher://" + manifest_url, fetch_url
+            )
+            fetch_url = re.sub(r"^gopher://", "", fetch_url)
         else:
-            url = urllib.parse.urljoin(manifestUrl, url)
-        return url
+            fetch_url = urllib.parse.urljoin(manifest_url, fetch_url)
+        return fetch_url
 
     def ToRemoteSpec(self, projectName):
         fetchUrl = self.resolvedFetchUrl.rstrip("/")
@@ -275,7 +305,7 @@ class _XmlSubmanifest:
             parent.repodir,
             linkFile,
             parent_groups=",".join(groups) or "",
-            submanifest_path=self.relpath,
+            submanifest_path=os.path.join(parent.path_prefix, self.relpath),
             outer_client=outer_client,
             default_groups=default_groups,
         )
@@ -354,7 +384,7 @@ class SubmanifestSpec:
         self.groups = groups or []
 
 
-class XmlManifest(object):
+class XmlManifest:
     """manages the repo configuration file"""
 
     def __init__(
@@ -404,11 +434,6 @@ class XmlManifest(object):
         self._load_local_manifests = True
         self.parent_groups = parent_groups
         self.default_groups = default_groups
-
-        if outer_client and self.isGitcClient:
-            raise ManifestParseError(
-                "Multi-manifest is incompatible with `gitc-init`"
-            )
 
         if submanifest_path and not outer_client:
             # If passing a submanifest_path, there must be an outer_client.
@@ -727,10 +752,10 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
             self._output_manifest_project_extras(p, e)
 
             if p.subprojects:
-                subprojects = set(subp.name for subp in p.subprojects)
+                subprojects = {subp.name for subp in p.subprojects}
                 output_projects(p, e, list(sorted(subprojects)))
 
-        projects = set(p.name for p in self._paths.values() if not p.parent)
+        projects = {p.name for p in self._paths.values() if not p.parent}
         output_projects(None, root, list(sorted(projects)))
 
         if self._repo_hooks_project:
@@ -800,17 +825,17 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
             for child in node.childNodes:
                 if child.nodeType == xml.dom.Node.ELEMENT_NODE:
                     attrs = child.attributes
-                    element = dict(
-                        (attrs.item(i).localName, attrs.item(i).value)
+                    element = {
+                        attrs.item(i).localName: attrs.item(i).value
                         for i in range(attrs.length)
-                    )
+                    }
                     if child.nodeName in SINGLE_ELEMENTS:
                         ret[child.nodeName] = element
                     elif child.nodeName in MULTI_ELEMENTS:
                         ret.setdefault(child.nodeName, []).append(element)
                     else:
                         raise ManifestParseError(
-                            'Unhandled element "%s"' % (child.nodeName,)
+                            f'Unhandled element "{child.nodeName}"'
                         )
 
                     append_children(element, child)
@@ -857,8 +882,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         self._Load()
         outer = self._outer_client
         yield outer
-        for tree in outer.all_children:
-            yield tree
+        yield from outer.all_children
 
     @property
     def all_children(self):
@@ -867,8 +891,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         for child in self._submanifests.values():
             if child.repo_client:
                 yield child.repo_client
-                for tree in child.repo_client.all_children:
-                    yield tree
+                yield from child.repo_client.all_children
 
     @property
     def path_prefix(self):
@@ -987,7 +1010,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
     @property
     def PartialCloneExclude(self):
         exclude = self.manifest.manifestProject.partial_clone_exclude or ""
-        return set(x.strip() for x in exclude.split(","))
+        return {x.strip() for x in exclude.split(",")}
 
     def SetManifestOverride(self, path):
         """Override manifestFile.  The caller must call Unload()"""
@@ -1260,18 +1283,19 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         try:
             root = xml.dom.minidom.parse(path)
         except (OSError, xml.parsers.expat.ExpatError) as e:
-            raise ManifestParseError(
-                "error parsing manifest %s: %s" % (path, e)
-            )
+            raise ManifestParseError(f"error parsing manifest {path}: {e}")
 
         if not root or not root.childNodes:
-            raise ManifestParseError("no root node in %s" % (path,))
+            raise ManifestParseError(f"no root node in {path}")
 
         for manifest in root.childNodes:
-            if manifest.nodeName == "manifest":
+            if (
+                manifest.nodeType == manifest.ELEMENT_NODE
+                and manifest.nodeName == "manifest"
+            ):
                 break
         else:
-            raise ManifestParseError("no <manifest> in %s" % (path,))
+            raise ManifestParseError(f"no <manifest> in {path}")
 
         nodes = []
         for node in manifest.childNodes:
@@ -1281,7 +1305,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
                     msg = self._CheckLocalPath(name)
                     if msg:
                         raise ManifestInvalidPathError(
-                            '<include> invalid "name": %s: %s' % (name, msg)
+                            f'<include> invalid "name": {name}: {msg}'
                         )
                 include_groups = ""
                 if parent_groups:
@@ -1313,7 +1337,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
                     raise
                 except Exception as e:
                     raise ManifestParseError(
-                        "failed parsing included manifest %s: %s" % (name, e)
+                        f"failed parsing included manifest {name}: {e}"
                     )
             else:
                 if parent_groups and node.nodeName == "project":
@@ -1421,6 +1445,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
 
         repo_hooks_project = None
         enabled_repo_hooks = None
+        failed_revision_changes = []
         for node in itertools.chain(*node_list):
             if node.nodeName == "project":
                 project = self._ParseProject(node)
@@ -1447,6 +1472,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
                     remote = self._get_remote(node)
                 dest_branch = node.getAttribute("dest-branch")
                 upstream = node.getAttribute("upstream")
+                base_revision = node.getAttribute("base-rev")
 
                 named_projects = self._projects[name]
                 if dest_path and not path and len(named_projects) > 1:
@@ -1460,6 +1486,13 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
                     if groups:
                         p.groups.extend(groups)
                     if revision:
+                        if base_revision:
+                            if p.revisionExpr != base_revision:
+                                failed_revision_changes.append(
+                                    "extend-project name %s mismatch base "
+                                    "%s vs revision %s"
+                                    % (name, base_revision, p.revisionExpr)
+                                )
                         p.SetRevision(revision)
 
                     if remote_name:
@@ -1534,6 +1567,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
             if node.nodeName == "remove-project":
                 name = node.getAttribute("name")
                 path = node.getAttribute("path")
+                base_revision = node.getAttribute("base-rev")
 
                 # Name or path needed.
                 if not name and not path:
@@ -1547,6 +1581,13 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
                 for projname, projects in list(self._projects.items()):
                     for p in projects:
                         if name == projname and not path:
+                            if base_revision:
+                                if p.revisionExpr != base_revision:
+                                    failed_revision_changes.append(
+                                        "remove-project name %s mismatch base "
+                                        "%s vs revision %s"
+                                        % (name, base_revision, p.revisionExpr)
+                                    )
                             del self._paths[p.relpath]
                             if not removed_project:
                                 del self._projects[name]
@@ -1554,6 +1595,17 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
                         elif path == p.relpath and (
                             name == projname or not name
                         ):
+                            if base_revision:
+                                if p.revisionExpr != base_revision:
+                                    failed_revision_changes.append(
+                                        "remove-project path %s mismatch base "
+                                        "%s vs revision %s"
+                                        % (
+                                            p.relpath,
+                                            base_revision,
+                                            p.revisionExpr,
+                                        )
+                                    )
                             self._projects[projname].remove(p)
                             del self._paths[p.relpath]
                             removed_project = p.name
@@ -1572,6 +1624,13 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
                         "remove-project element specifies non-existent "
                         "project: %s" % node.toxml()
                     )
+
+        if failed_revision_changes:
+            raise ManifestParseError(
+                "revision base check failed, rebase patches and update "
+                "base revs for: ",
+                failed_revision_changes,
+            )
 
         # Store repo hooks project information.
         if repo_hooks_project:
@@ -1764,13 +1823,13 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
                 msg = self._CheckLocalPath(name)
                 if msg:
                     raise ManifestInvalidPathError(
-                        '<submanifest> invalid "name": %s: %s' % (name, msg)
+                        f'<submanifest> invalid "name": {name}: {msg}'
                     )
         else:
             msg = self._CheckLocalPath(path)
             if msg:
                 raise ManifestInvalidPathError(
-                    '<submanifest> invalid "path": %s: %s' % (path, msg)
+                    f'<submanifest> invalid "path": {path}: {msg}'
                 )
 
         submanifest = _XmlSubmanifest(
@@ -1805,7 +1864,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         msg = self._CheckLocalPath(name, dir_ok=True)
         if msg:
             raise ManifestInvalidPathError(
-                '<project> invalid "name": %s: %s' % (name, msg)
+                f'<project> invalid "name": {name}: {msg}'
             )
         if parent:
             name = self._JoinName(parent.name, name)
@@ -1815,7 +1874,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
             remote = self._default.remote
         if remote is None:
             raise ManifestParseError(
-                "no remote for project %s within %s" % (name, self.manifestFile)
+                f"no remote for project {name} within {self.manifestFile}"
             )
 
         revisionExpr = node.getAttribute("revision") or remote.revision
@@ -1836,7 +1895,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
             msg = self._CheckLocalPath(path, dir_ok=True, cwd_dot_ok=True)
             if msg:
                 raise ManifestInvalidPathError(
-                    '<project> invalid "path": %s: %s' % (path, msg)
+                    f'<project> invalid "path": {path}: {msg}'
                 )
 
         rebase = XmlBool(node, "rebase", True)
@@ -1997,7 +2056,12 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         path = path.rstrip("/")
         name = name.rstrip("/")
         relpath = self._JoinRelpath(parent.relpath, path)
-        gitdir = os.path.join(parent.gitdir, "subprojects", "%s.git" % path)
+        subprojects = os.path.join(parent.gitdir, "subprojects", f"{path}.git")
+        modules = os.path.join(parent.gitdir, "modules", path)
+        if platform_utils.isdir(subprojects):
+            gitdir = subprojects
+        else:
+            gitdir = modules
         objdir = os.path.join(
             parent.gitdir, "subproject-objects", "%s.git" % name
         )
@@ -2093,7 +2157,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         if not cwd_dot_ok or parts != ["."]:
             for part in set(parts):
                 if part in {".", "..", ".git"} or part.startswith(".repo"):
-                    return "bad component: %s" % (part,)
+                    return f"bad component: {part}"
 
         if not dir_ok and resep.match(path[-1]):
             return "dirs not allowed"
@@ -2129,7 +2193,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         msg = cls._CheckLocalPath(dest)
         if msg:
             raise ManifestInvalidPathError(
-                '<%s> invalid "dest": %s: %s' % (element, dest, msg)
+                f'<{element}> invalid "dest": {dest}: {msg}'
             )
 
         # |src| is the file we read from or path we point to for symlinks.
@@ -2140,7 +2204,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         )
         if msg:
             raise ManifestInvalidPathError(
-                '<%s> invalid "src": %s: %s' % (element, src, msg)
+                f'<{element}> invalid "src": {src}: {msg}'
             )
 
     def _ParseCopyFile(self, project, node):
@@ -2184,7 +2248,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         v = self._remotes.get(name)
         if not v:
             raise ManifestParseError(
-                "remote %s not defined in %s" % (name, self.manifestFile)
+                f"remote {name} not defined in {self.manifestFile}"
             )
         return v
 
@@ -2261,7 +2325,6 @@ class RepoClient(XmlManifest):
             submanifest_path: The submanifest root relative to the repo root.
             **kwargs: Additional keyword arguments, passed to XmlManifest.
         """
-        self.isGitcClient = False
         submanifest_path = submanifest_path or ""
         if submanifest_path:
             self._CheckLocalPath(submanifest_path)

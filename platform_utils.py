@@ -57,8 +57,8 @@ def _validate_winpath(path):
     if _winpath_is_valid(path):
         return path
     raise ValueError(
-        'Path "{}" must be a relative path or an absolute '
-        "path starting with a drive letter".format(path)
+        f'Path "{path}" must be a relative path or an absolute '
+        "path starting with a drive letter"
     )
 
 
@@ -193,10 +193,9 @@ def _walk_windows_impl(top, topdown, onerror, followlinks):
     for name in dirs:
         new_path = os.path.join(top, name)
         if followlinks or not islink(new_path):
-            for x in _walk_windows_impl(
+            yield from _walk_windows_impl(
                 new_path, topdown, onerror, followlinks
-            ):
-                yield x
+            )
     if not topdown:
         yield top, dirs, nondirs
 
@@ -252,32 +251,3 @@ def readlink(path):
         return platform_utils_win32.readlink(_makelongpath(path))
     else:
         return os.readlink(path)
-
-
-def realpath(path):
-    """Return the canonical path of the specified filename, eliminating
-    any symbolic links encountered in the path.
-
-    Availability: Windows, Unix.
-    """
-    if isWindows():
-        current_path = os.path.abspath(path)
-        path_tail = []
-        for c in range(0, 100):  # Avoid cycles
-            if islink(current_path):
-                target = readlink(current_path)
-                current_path = os.path.join(
-                    os.path.dirname(current_path), target
-                )
-            else:
-                basename = os.path.basename(current_path)
-                if basename == "":
-                    path_tail.append(current_path)
-                    break
-                path_tail.append(basename)
-                current_path = os.path.dirname(current_path)
-        path_tail.reverse()
-        result = os.path.normpath(os.path.join(*path_tail))
-        return result
-    else:
-        return os.path.realpath(path)

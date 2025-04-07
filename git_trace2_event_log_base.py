@@ -38,11 +38,13 @@ import tempfile
 import threading
 
 
+# Timeout when sending events via socket (applies to connect, send)
+SOCK_TIMEOUT = 0.5  # in seconds
 # BaseEventLog __init__ Counter that is consistent within the same process
 p_init_count = 0
 
 
-class BaseEventLog(object):
+class BaseEventLog:
     """Event log that records events that occurred during a repo invocation.
 
     Events are written to the log as a consecutive JSON entries, one per line.
@@ -76,9 +78,8 @@ class BaseEventLog(object):
         # Save both our sid component and the complete sid.
         # We use our sid component (self._sid) as the unique filename prefix and
         # the full sid (self._full_sid) in the log itself.
-        self._sid = "repo-%s-P%08x" % (
-            self.start.strftime("%Y%m%dT%H%M%SZ"),
-            os.getpid(),
+        self._sid = (
+            f"repo-{self.start.strftime('%Y%m%dT%H%M%SZ')}-P{os.getpid():08x}"
         )
 
         if add_init_count:
@@ -129,10 +130,10 @@ class BaseEventLog(object):
             "time": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
 
-    def StartEvent(self):
+    def StartEvent(self, argv):
         """Append a 'start' event to the current log."""
         start_event = self._CreateEventDict("start")
-        start_event["argv"] = sys.argv
+        start_event["argv"] = argv
         self._log.append(start_event)
 
     def ExitEvent(self, result):
@@ -158,9 +159,11 @@ class BaseEventLog(object):
             name: Name of the primary command (ex: repo, git)
             subcommands: List of the sub-commands (ex: version, init, sync)
         """
-        command_event = self._CreateEventDict("command")
+        command_event = self._CreateEventDict("cmd_name")
+        name = f"{name}-"
+        name += "-".join(subcommands)
         command_event["name"] = name
-        command_event["subcommands"] = subcommands
+        command_event["hierarchy"] = name
         self._log.append(command_event)
 
     def LogConfigEvents(self, config, event_dict_name):
@@ -297,6 +300,7 @@ class BaseEventLog(object):
                     with socket.socket(
                         socket.AF_UNIX, socket.SOCK_STREAM
                     ) as sock:
+                        sock.settimeout(SOCK_TIMEOUT)
                         sock.connect(path)
                         self._WriteLog(sock.sendall)
                     return f"af_unix:stream:{path}"

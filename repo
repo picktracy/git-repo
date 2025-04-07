@@ -1,5 +1,4 @@
-#!/usr/bin/env python
-# -*- coding:utf-8 -*-
+#!/usr/bin/env python3
 #
 # Copyright (C) 2008 The Android Open Source Project
 #
@@ -22,8 +21,6 @@ It is used to get an initial repo client checkout, and after that it runs the
 copy of repo in the checkout.
 """
 
-from __future__ import print_function
-
 import datetime
 import os
 import platform
@@ -36,11 +33,11 @@ import sys
 # bit more flexible with older systems.  See that file for more details on the
 # versions we select.
 MIN_PYTHON_VERSION_SOFT = (3, 6)
-MIN_PYTHON_VERSION_HARD = (3, 5)
+MIN_PYTHON_VERSION_HARD = (3, 6)
 
 
 # Keep basic logic in sync with repo_trace.py.
-class Trace(object):
+class Trace:
     """Trace helper logic."""
 
     REPO_TRACE = "REPO_TRACE"
@@ -82,24 +79,13 @@ def check_python_version():
     major = ver.major
     minor = ver.minor
 
-    # Abort on very old Python 2 versions.
-    if (major, minor) < (2, 7):
-        print(
-            "repo: error: Your Python version is too old. "
-            "Please use Python {}.{} or newer instead.".format(
-                *MIN_PYTHON_VERSION_SOFT
-            ),
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    # Try to re-exec the version specific Python 3 if needed.
+    # Try to re-exec the version specific Python if needed.
     if (major, minor) < MIN_PYTHON_VERSION_SOFT:
         # Python makes releases ~once a year, so try our min version +10 to help
         # bridge the gap.  This is the fallback anyways so perf isn't critical.
         min_major, min_minor = MIN_PYTHON_VERSION_SOFT
         for inc in range(0, 10):
-            reexec("python{}.{}".format(min_major, min_minor + inc))
+            reexec(f"python{min_major}.{min_minor + inc}")
 
         # Fallback to older versions if possible.
         for inc in range(
@@ -108,47 +94,12 @@ def check_python_version():
             # Don't downgrade, and don't reexec ourselves (which would infinite loop).
             if (min_major, min_minor - inc) <= (major, minor):
                 break
-            reexec("python{}.{}".format(min_major, min_minor - inc))
-
-        # Try the generic Python 3 wrapper, but only if it's new enough.  If it
-        # isn't, we want to just give up below and make the user resolve things.
-        try:
-            proc = subprocess.Popen(
-                [
-                    "python3",
-                    "-c",
-                    "import sys; "
-                    "print(sys.version_info.major, sys.version_info.minor)",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            (output, _) = proc.communicate()
-            python3_ver = tuple(int(x) for x in output.decode("utf-8").split())
-        except (OSError, subprocess.CalledProcessError):
-            python3_ver = None
-
-        # If the python3 version looks like it's new enough, give it a try.
-        if (
-            python3_ver
-            and python3_ver >= MIN_PYTHON_VERSION_HARD
-            and python3_ver != (major, minor)
-        ):
-            reexec("python3")
+            reexec(f"python{min_major}.{min_minor - inc}")
 
         # We're still here, so diagnose things for the user.
-        if major < 3:
+        if (major, minor) < MIN_PYTHON_VERSION_HARD:
             print(
-                "repo: error: Python 2 is no longer supported; "
-                "Please upgrade to Python {}.{}+.".format(
-                    *MIN_PYTHON_VERSION_HARD
-                ),
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        elif (major, minor) < MIN_PYTHON_VERSION_HARD:
-            print(
-                "repo: error: Python 3 version is too old; "
+                "repo: error: Python version is too old; "
                 "Please use Python {}.{} or newer.".format(
                     *MIN_PYTHON_VERSION_HARD
                 ),
@@ -173,7 +124,7 @@ if not REPO_REV:
 BUG_URL = "https://issues.gerritcodereview.com/issues/new?component=1370071"
 
 # increment this whenever we make important changes to this script
-VERSION = (2, 37)
+VERSION = (2, 50)
 
 # increment this if the MAINTAINER_KEYS block is modified
 KEYRING_VERSION = (2, 3)
@@ -259,15 +210,11 @@ GIT = "git"  # our git command
 # NB: The version of git that the repo launcher requires may be much older than
 # the version of git that the main repo source tree requires.  Keeping this at
 # an older version also makes it easier for users to upgrade/rollback as needed.
-#
-# git-1.7 is in (EOL) Ubuntu Precise.
-MIN_GIT_VERSION = (1, 7, 2)  # minimum supported git version
+MIN_GIT_VERSION = (1, 7, 9)  # minimum supported git version
 repodir = ".repo"  # name of repo's private directory
 S_repo = "repo"  # special repo repository
 S_manifests = "manifests"  # special manifest repository
 REPO_MAIN = S_repo + "/main.py"  # main script
-GITC_CONFIG_FILE = "/gitc/.config"
-GITC_FS_ROOT_DIR = "/gitc/manifest-rw/"
 
 
 import collections
@@ -277,19 +224,8 @@ import optparse
 import re
 import shutil
 import stat
-
-
-if sys.version_info[0] == 3:
-    import urllib.error
-    import urllib.request
-else:
-    import imp
-
-    import urllib2
-
-    urllib = imp.new_module("urllib")
-    urllib.request = urllib2
-    urllib.error = urllib2
+import urllib.error
+import urllib.request
 
 
 repo_config_dir = os.getenv("REPO_CONFIG_DIR", os.path.expanduser("~"))
@@ -297,12 +233,9 @@ home_dot_repo = os.path.join(repo_config_dir, ".repoconfig")
 gpg_dir = os.path.join(home_dot_repo, "gnupg")
 
 
-def GetParser(gitc_init=False):
+def GetParser():
     """Setup the CLI parser."""
-    if gitc_init:
-        sys.exit("repo: fatal: GITC not supported.")
-    else:
-        usage = "repo init [options] [-u] url"
+    usage = "repo init [options] [-u] url"
 
     parser = optparse.OptionParser(usage=usage)
     InitParser(parser)
@@ -343,6 +276,12 @@ def InitParser(parser):
         "--manifest-branch",
         metavar="REVISION",
         help="manifest branch or revision (use HEAD for default)",
+    )
+    group.add_option(
+        "--manifest-upstream-branch",
+        help="when a commit is provided to --manifest-branch, this "
+        "is the name of the git ref in which the commit can be found",
+        metavar="BRANCH",
     )
     group.add_option(
         "-m",
@@ -569,8 +508,7 @@ def run_command(cmd, **kwargs):
             return output.decode("utf-8")
         except UnicodeError:
             print(
-                "repo: warning: Invalid UTF-8 output:\ncmd: %r\n%r"
-                % (cmd, output),
+                f"repo: warning: Invalid UTF-8 output:\ncmd: {cmd!r}\n{output}",
                 file=sys.stderr,
             )
             return output.decode("utf-8", "backslashreplace")
@@ -593,20 +531,17 @@ def run_command(cmd, **kwargs):
     # If things failed, print useful debugging output.
     if check and ret.returncode:
         print(
-            'repo: error: "%s" failed with exit status %s'
-            % (cmd[0], ret.returncode),
+            f'repo: error: "{cmd[0]}" failed with exit status {ret.returncode}',
             file=sys.stderr,
         )
-        print(
-            "  cwd: %s\n  cmd: %r" % (kwargs.get("cwd", os.getcwd()), cmd),
-            file=sys.stderr,
-        )
+        cwd = kwargs.get("cwd", os.getcwd())
+        print(f"  cwd: {cwd}\n  cmd: {cmd!r}", file=sys.stderr)
 
         def _print_output(name, output):
             if output:
                 print(
-                    "  %s:\n  >> %s"
-                    % (name, "\n  >> ".join(output.splitlines())),
+                    f"  {name}:"
+                    + "".join(f"\n  >> {x}" for x in output.splitlines()),
                     file=sys.stderr,
                 )
 
@@ -615,49 +550,6 @@ def run_command(cmd, **kwargs):
         raise RunError(ret)
 
     return ret
-
-
-_gitc_manifest_dir = None
-
-
-def get_gitc_manifest_dir():
-    global _gitc_manifest_dir
-    if _gitc_manifest_dir is None:
-        _gitc_manifest_dir = ""
-        try:
-            with open(GITC_CONFIG_FILE, "r") as gitc_config:
-                for line in gitc_config:
-                    match = re.match("gitc_dir=(?P<gitc_manifest_dir>.*)", line)
-                    if match:
-                        _gitc_manifest_dir = match.group("gitc_manifest_dir")
-        except IOError:
-            pass
-    return _gitc_manifest_dir
-
-
-def gitc_parse_clientdir(gitc_fs_path):
-    """Parse a path in the GITC FS and return its client name.
-
-    Args:
-        gitc_fs_path: A subdirectory path within the GITC_FS_ROOT_DIR.
-
-    Returns:
-        The GITC client name.
-    """
-    if gitc_fs_path == GITC_FS_ROOT_DIR:
-        return None
-    if not gitc_fs_path.startswith(GITC_FS_ROOT_DIR):
-        manifest_dir = get_gitc_manifest_dir()
-        if manifest_dir == "":
-            return None
-        if manifest_dir[-1] != "/":
-            manifest_dir += "/"
-        if gitc_fs_path == manifest_dir:
-            return None
-        if not gitc_fs_path.startswith(manifest_dir):
-            return None
-        return gitc_fs_path.split(manifest_dir)[1].split("/")[0]
-    return gitc_fs_path.split(GITC_FS_ROOT_DIR)[1].split("/")[0]
 
 
 class CloneFailure(Exception):
@@ -698,9 +590,9 @@ def check_repo_rev(dst, rev, repo_verify=True, quiet=False):
     return (remote_ref, rev)
 
 
-def _Init(args, gitc_init=False):
+def _Init(args):
     """Installs repo by cloning it over the network."""
-    parser = GetParser(gitc_init=gitc_init)
+    parser = GetParser()
     opt, args = parser.parse_args(args)
     if args:
         if not opt.manifest_url:
@@ -722,7 +614,7 @@ def _Init(args, gitc_init=False):
     except OSError as e:
         if e.errno != errno.EEXIST:
             print(
-                "fatal: cannot make %s directory: %s" % (repodir, e.strerror),
+                f"fatal: cannot make {repodir} directory: {e.strerror}",
                 file=sys.stderr,
             )
             # Don't raise CloneFailure; that would delete the
@@ -820,7 +712,7 @@ def _CheckGitVersion():
     if ver_act < MIN_GIT_VERSION:
         need = ".".join(map(str, MIN_GIT_VERSION))
         print(
-            "fatal: git %s or later required; found %s" % (need, ver_act.full),
+            f"fatal: git {need} or later required; found {ver_act.full}",
             file=sys.stderr,
         )
         raise CloneFailure()
@@ -839,7 +731,8 @@ def SetGitTrace2ParentSid(env=None):
     KEY = "GIT_TRACE2_PARENT_SID"
 
     now = datetime.datetime.now(datetime.timezone.utc)
-    value = "repo-%s-P%08x" % (now.strftime("%Y%m%dT%H%M%SZ"), os.getpid())
+    timestamp = now.strftime("%Y%m%dT%H%M%SZ")
+    value = f"repo-{timestamp}-P{os.getpid():08x}"
 
     # If it's already set, then append ourselves.
     if KEY in env:
@@ -883,8 +776,7 @@ def SetupGnuPG(quiet):
     except OSError as e:
         if e.errno != errno.EEXIST:
             print(
-                "fatal: cannot make %s directory: %s"
-                % (home_dot_repo, e.strerror),
+                f"fatal: cannot make {home_dot_repo} directory: {e.strerror}",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -894,15 +786,15 @@ def SetupGnuPG(quiet):
     except OSError as e:
         if e.errno != errno.EEXIST:
             print(
-                "fatal: cannot make %s directory: %s" % (gpg_dir, e.strerror),
+                f"fatal: cannot make {gpg_dir} directory: {e.strerror}",
                 file=sys.stderr,
             )
             sys.exit(1)
 
     if not quiet:
         print(
-            "repo: Updating release signing keys to keyset ver %s"
-            % (".".join(str(x) for x in KEYRING_VERSION),)
+            "repo: Updating release signing keys to keyset ver "
+            + ".".join(str(x) for x in KEYRING_VERSION),
         )
     # NB: We use --homedir (and cwd below) because some environments (Windows) do
     # not correctly handle full native paths.  We avoid the issue by changing to
@@ -954,7 +846,7 @@ def _GetRepoConfig(name):
         return None
     else:
         print(
-            "repo: error: git %s failed:\n%s" % (" ".join(cmd), ret.stderr),
+            f"repo: error: git {' '.join(cmd)} failed:\n{ret.stderr}",
             file=sys.stderr,
         )
         raise RunError()
@@ -1067,7 +959,7 @@ def _Clone(url, cwd, clone_bundle, quiet, verbose):
         os.mkdir(cwd)
     except OSError as e:
         print(
-            "fatal: cannot make %s directory: %s" % (cwd, e.strerror),
+            f"fatal: cannot make {cwd} directory: {e.strerror}",
             file=sys.stderr,
         )
         raise CloneFailure()
@@ -1107,7 +999,7 @@ def resolve_repo_rev(cwd, committish):
         ret = run_git(
             "rev-parse",
             "--verify",
-            "%s^{commit}" % (committish,),
+            f"{committish}^{{commit}}",
             cwd=cwd,
             check=False,
         )
@@ -1120,7 +1012,7 @@ def resolve_repo_rev(cwd, committish):
         rev = resolve("refs/remotes/origin/%s" % committish)
         if rev is None:
             print(
-                'repo: error: unknown branch "%s"' % (committish,),
+                f'repo: error: unknown branch "{committish}"',
                 file=sys.stderr,
             )
             raise CloneFailure()
@@ -1133,7 +1025,8 @@ def resolve_repo_rev(cwd, committish):
         rev = resolve(remote_ref)
         if rev is None:
             print(
-                'repo: error: unknown tag "%s"' % (committish,), file=sys.stderr
+                f'repo: error: unknown tag "{committish}"',
+                file=sys.stderr,
             )
             raise CloneFailure()
         return (remote_ref, rev)
@@ -1141,12 +1034,12 @@ def resolve_repo_rev(cwd, committish):
     # See if it's a short branch name.
     rev = resolve("refs/remotes/origin/%s" % committish)
     if rev:
-        return ("refs/heads/%s" % (committish,), rev)
+        return (f"refs/heads/{committish}", rev)
 
     # See if it's a tag.
-    rev = resolve("refs/tags/%s" % committish)
+    rev = resolve(f"refs/tags/{committish}")
     if rev:
-        return ("refs/tags/%s" % (committish,), rev)
+        return (f"refs/tags/{committish}", rev)
 
     # See if it's a commit.
     rev = resolve(committish)
@@ -1155,7 +1048,8 @@ def resolve_repo_rev(cwd, committish):
 
     # Give up!
     print(
-        'repo: error: unable to resolve "%s"' % (committish,), file=sys.stderr
+        f'repo: error: unable to resolve "{committish}"',
+        file=sys.stderr,
     )
     raise CloneFailure()
 
@@ -1171,8 +1065,8 @@ def verify_rev(cwd, remote_ref, rev, quiet):
         if not quiet:
             print(file=sys.stderr)
             print(
-                "warning: '%s' is not signed; falling back to signed release '%s'"
-                % (remote_ref, cur),
+                f"warning: '{remote_ref}' is not signed; "
+                f"falling back to signed release '{cur}'",
                 file=sys.stderr,
             )
             print(file=sys.stderr)
@@ -1214,7 +1108,7 @@ def _FindRepo():
     return (repo, os.path.join(curdir, repodir))
 
 
-class _Options(object):
+class _Options:
     help = False
     version = False
 
@@ -1222,10 +1116,10 @@ class _Options(object):
 def _ExpandAlias(name):
     """Look up user registered aliases."""
     # We don't resolve aliases for existing subcommands.  This matches git.
-    if name in {"gitc-init", "help", "init"}:
+    if name in {"help", "init"}:
         return name, []
 
-    alias = _GetRepoConfig("alias.%s" % (name,))
+    alias = _GetRepoConfig(f"alias.{name}")
     if alias is None:
         return name, []
 
@@ -1258,7 +1152,7 @@ def _ParseArguments(args):
     return cmd, opt, arg
 
 
-class Requirements(object):
+class Requirements:
     """Helper for checking repo's system requirements."""
 
     REQUIREMENTS_NAME = "requirements.json"
@@ -1280,8 +1174,7 @@ class Requirements(object):
         try:
             with open(path, "rb") as f:
                 data = f.read()
-        except EnvironmentError:
-            # NB: EnvironmentError is used for Python 2 & 3 compatibility.
+        except OSError:
             # If we couldn't open the file, assume it's an old source tree.
             return None
 
@@ -1301,13 +1194,13 @@ class Requirements(object):
 
         return cls(json_data)
 
-    def _get_soft_ver(self, pkg):
+    def get_soft_ver(self, pkg):
         """Return the soft version for |pkg| if it exists."""
-        return self.requirements.get(pkg, {}).get("soft", ())
+        return tuple(self.requirements.get(pkg, {}).get("soft", ()))
 
-    def _get_hard_ver(self, pkg):
+    def get_hard_ver(self, pkg):
         """Return the hard version for |pkg| if it exists."""
-        return self.requirements.get(pkg, {}).get("hard", ())
+        return tuple(self.requirements.get(pkg, {}).get("hard", ()))
 
     @staticmethod
     def _format_ver(ver):
@@ -1317,22 +1210,24 @@ class Requirements(object):
     def assert_ver(self, pkg, curr_ver):
         """Verify |pkg|'s |curr_ver| is new enough."""
         curr_ver = tuple(curr_ver)
-        soft_ver = tuple(self._get_soft_ver(pkg))
-        hard_ver = tuple(self._get_hard_ver(pkg))
+        soft_ver = tuple(self.get_soft_ver(pkg))
+        hard_ver = tuple(self.get_hard_ver(pkg))
         if curr_ver < hard_ver:
             print(
-                'repo: error: Your version of "%s" (%s) is unsupported; '
-                "Please upgrade to at least version %s to continue."
-                % (pkg, self._format_ver(curr_ver), self._format_ver(soft_ver)),
+                f'repo: error: Your version of "{pkg}" '
+                f"({self._format_ver(curr_ver)}) is unsupported; "
+                "Please upgrade to at least version "
+                f"{self._format_ver(soft_ver)} to continue.",
                 file=sys.stderr,
             )
             sys.exit(1)
 
         if curr_ver < soft_ver:
             print(
-                'repo: warning: Your version of "%s" (%s) is no longer supported; '
-                "Please upgrade to at least version %s to avoid breakage."
-                % (pkg, self._format_ver(curr_ver), self._format_ver(soft_ver)),
+                f'repo: error: Your version of "{pkg}" '
+                f"({self._format_ver(curr_ver)}) is no longer supported; "
+                "Please upgrade to at least version "
+                f"{self._format_ver(soft_ver)} to continue.",
                 file=sys.stderr,
             )
 
@@ -1349,10 +1244,6 @@ class Requirements(object):
 
 
 def _Usage():
-    gitc_usage = ""
-    if get_gitc_manifest_dir():
-        gitc_usage = "  gitc-init Initialize a GITC Client.\n"
-
     print(
         """usage: repo COMMAND [ARGS]
 
@@ -1361,9 +1252,7 @@ repo is not yet installed.  Use "repo init" to install it here.
 The most commonly used repo commands are:
 
   init      Install repo in the current working directory
-"""
-        + gitc_usage
-        + """  help      Display detailed help on a command
+  help      Display detailed help on a command
 
 For access to the full online help, install repo ("repo init").
 """
@@ -1374,8 +1263,8 @@ For access to the full online help, install repo ("repo init").
 
 def _Help(args):
     if args:
-        if args[0] in {"init", "gitc-init"}:
-            parser = GetParser(gitc_init=args[0] == "gitc-init")
+        if args[0] in {"init"}:
+            parser = GetParser()
             parser.print_help()
             sys.exit(0)
         else:
@@ -1392,21 +1281,16 @@ def _Help(args):
 
 def _Version():
     """Show version information."""
+    git_version = ParseGitVersion()
     print("<repo not installed>")
-    print("repo launcher version %s" % (".".join(str(x) for x in VERSION),))
-    print("       (from %s)" % (__file__,))
-    print("git %s" % (ParseGitVersion().full,))
-    print("Python %s" % sys.version)
+    print(f"repo launcher version {'.'.join(str(x) for x in VERSION)}")
+    print(f"       (from {__file__})")
+    print(f"git {git_version.full}" if git_version else "git not installed")
+    print(f"Python {sys.version}")
     uname = platform.uname()
-    if sys.version_info.major < 3:
-        # Python 3 returns a named tuple, but Python 2 is simpler.
-        print(uname)
-    else:
-        print("OS %s %s (%s)" % (uname.system, uname.release, uname.version))
-        print(
-            "CPU %s (%s)"
-            % (uname.machine, uname.processor if uname.processor else "unknown")
-        )
+    print(f"OS {uname.system} {uname.release} ({uname.version})")
+    processor = uname.processor if uname.processor else "unknown"
+    print(f"CPU {uname.machine} ({processor})")
     print("Bug reports:", BUG_URL)
     sys.exit(0)
 
@@ -1434,11 +1318,11 @@ def _RunSelf(wrapper_path):
     my_main = os.path.join(my_dir, "main.py")
     my_git = os.path.join(my_dir, ".git")
 
-    if os.path.isfile(my_main) and os.path.isdir(my_git):
+    if os.path.isfile(my_main):
         for name in ["git_config.py", "project.py", "subcmds"]:
             if not os.path.exists(os.path.join(my_dir, name)):
                 return None, None
-        return my_main, my_git
+        return my_main, my_git if os.path.isdir(my_git) else None
     return None, None
 
 
@@ -1469,23 +1353,11 @@ def main(orig_args):
     # We run this early as we run some git commands ourselves.
     SetGitTrace2ParentSid()
 
-    repo_main, rel_repo_dir = None, None
-    # Don't use the local repo copy, make sure to switch to the gitc client first.
-    if cmd != "gitc-init":
-        repo_main, rel_repo_dir = _FindRepo()
+    repo_main, rel_repo_dir = _FindRepo()
 
     wrapper_path = os.path.abspath(__file__)
     my_main, my_git = _RunSelf(wrapper_path)
 
-    cwd = os.getcwd()
-    if get_gitc_manifest_dir() and cwd.startswith(get_gitc_manifest_dir()):
-        print(
-            "error: repo cannot be used in the GITC local manifest directory."
-            "\nIf you want to work on this GITC client please rerun this "
-            "command from the corresponding client under /gitc/",
-            file=sys.stderr,
-        )
-        sys.exit(1)
     if not repo_main:
         # Only expand aliases here since we'll be parsing the CLI ourselves.
         # If we had repo_main, alias expansion would happen in main.py.
@@ -1500,11 +1372,11 @@ def main(orig_args):
             _Version()
         if not cmd:
             _NotInstalled()
-        if cmd == "init" or cmd == "gitc-init":
+        if cmd == "init":
             if my_git:
                 _SetDefaultsTo(my_git)
             try:
-                _Init(args, gitc_init=(cmd == "gitc-init"))
+                _Init(args)
             except CloneFailure:
                 path = os.path.join(repodir, S_repo)
                 print(
@@ -1529,6 +1401,14 @@ def main(orig_args):
     reqs = Requirements.from_dir(os.path.dirname(repo_main))
     if reqs:
         reqs.assert_all()
+
+    # Python 3.11 introduces PYTHONSAFEPATH and the -P flag which, if enabled,
+    # does not prepend the script's directory to sys.path by default.
+    # repo relies on this import path, so add directory of REPO_MAIN to
+    # PYTHONPATH so that this continues to work when PYTHONSAFEPATH is enabled.
+    python_paths = os.environ.get("PYTHONPATH", "").split(os.pathsep)
+    new_python_paths = [os.path.join(rel_repo_dir, S_repo)] + python_paths
+    os.environ["PYTHONPATH"] = os.pathsep.join(new_python_paths)
 
     ver_str = ".".join(map(str, VERSION))
     me = [

@@ -47,9 +47,9 @@ from command import InteractiveCommand
 from command import MirrorSafeCommand
 from editor import Editor
 from error import DownloadError
-from error import GitcUnsupportedError
 from error import InvalidProjectGroupsError
 from error import ManifestInvalidRevisionError
+from error import ManifestParseError
 from error import NoManifestException
 from error import NoSuchProjectError
 from error import RepoChangedException
@@ -88,27 +88,19 @@ logger = RepoLogger(__file__)
 MIN_PYTHON_VERSION_SOFT = (3, 6)
 MIN_PYTHON_VERSION_HARD = (3, 6)
 
-if sys.version_info.major < 3:
+if sys.version_info < MIN_PYTHON_VERSION_HARD:
     logger.error(
-        "repo: error: Python 2 is no longer supported; "
+        "repo: error: Python version is too old; "
         "Please upgrade to Python %d.%d+.",
         *MIN_PYTHON_VERSION_SOFT,
     )
     sys.exit(1)
-else:
-    if sys.version_info < MIN_PYTHON_VERSION_HARD:
-        logger.error(
-            "repo: error: Python 3 version is too old; "
-            "Please upgrade to Python %d.%d+.",
-            *MIN_PYTHON_VERSION_SOFT,
-        )
-        sys.exit(1)
-    elif sys.version_info < MIN_PYTHON_VERSION_SOFT:
-        logger.error(
-            "repo: warning: your Python 3 version is no longer supported; "
-            "Please upgrade to Python %d.%d+.",
-            *MIN_PYTHON_VERSION_SOFT,
-        )
+elif sys.version_info < MIN_PYTHON_VERSION_SOFT:
+    logger.error(
+        "repo: warning: your Python version is no longer supported; "
+        "Please upgrade to Python %d.%d+.",
+        *MIN_PYTHON_VERSION_SOFT,
+    )
 
 KEYBOARD_INTERRUPT_EXIT = 128 + signal.SIGINT
 MAX_PRINT_ERRORS = 5
@@ -196,7 +188,7 @@ global_options.add_option(
 )
 
 
-class _Repo(object):
+class _Repo:
     def __init__(self, repodir):
         self.repodir = repodir
         self.commands = all_commands
@@ -208,9 +200,8 @@ class _Repo(object):
         if short:
             commands = " ".join(sorted(self.commands))
             wrapped_commands = textwrap.wrap(commands, width=77)
-            print(
-                "Available commands:\n  %s" % ("\n  ".join(wrapped_commands),)
-            )
+            help_commands = "".join(f"\n  {x}" for x in wrapped_commands)
+            print(f"Available commands:{help_commands}")
             print("\nRun `repo help <command>` for command-specific details.")
             print("Bug reports:", Wrapper().BUG_URL)
         else:
@@ -246,7 +237,7 @@ class _Repo(object):
         if name in self.commands:
             return name, []
 
-        key = "alias.%s" % (name,)
+        key = f"alias.{name}"
         alias = RepoConfig.ForRepository(self.repodir).GetString(key)
         if alias is None:
             alias = RepoConfig.ForUser().GetString(key)
@@ -280,10 +271,14 @@ class _Repo(object):
             self._PrintHelp(short=True)
             return 1
 
-        run = lambda: self._RunLong(name, gopts, argv) or 0
+        git_trace2_event_log = EventLog()
+        run = (
+            lambda: self._RunLong(name, gopts, argv, git_trace2_event_log) or 0
+        )
         with Trace(
-            "starting new command: %s",
+            "starting new command: %s [sid=%s]",
             ", ".join([name] + argv),
+            git_trace2_event_log.full_sid,
             first_trace=True,
         ):
             if gopts.trace_python:
@@ -300,12 +295,11 @@ class _Repo(object):
                 result = run()
         return result
 
-    def _RunLong(self, name, gopts, argv):
+    def _RunLong(self, name, gopts, argv, git_trace2_event_log):
         """Execute the (longer running) requested subcommand."""
         result = 0
         SetDefaultColoring(gopts.color)
 
-        git_trace2_event_log = EventLog()
         outer_client = RepoClient(self.repodir)
         repo_client = outer_client
         if gopts.submanifest_path:
@@ -314,10 +308,6 @@ class _Repo(object):
                 submanifest_path=gopts.submanifest_path,
                 outer_client=outer_client,
             )
-
-        if Wrapper().gitc_parse_clientdir(os.getcwd()):
-            logger.error("GITC is not supported.")
-            raise GitcUnsupportedError()
 
         try:
             cmd = self.commands[name](
@@ -364,7 +354,7 @@ class _Repo(object):
         start = time.time()
         cmd_event = cmd.event_log.Add(name, event_log.TASK_COMMAND, start)
         cmd.event_log.SetParent(cmd_event)
-        git_trace2_event_log.StartEvent()
+        git_trace2_event_log.StartEvent(["repo", name] + argv)
         git_trace2_event_log.CommandEvent(name="repo", subcommands=[name])
 
         def execute_command_helper():
@@ -432,7 +422,7 @@ class _Repo(object):
                         error_info = json.dumps(
                             {
                                 "ErrorType": type(error).__name__,
-                                "Project": project,
+                                "Project": str(project),
                                 "Message": str(error),
                             }
                         )
@@ -450,6 +440,7 @@ class _Repo(object):
         except (
             DownloadError,
             ManifestInvalidRevisionError,
+            ManifestParseError,
             NoManifestException,
         ) as e:
             logger.error("error: in `%s`: %s", " ".join([name] + argv), e)
@@ -568,9 +559,11 @@ repo: error:
         sys.exit(1)
 
     if exp > ver:
-        logger.warn("\n... A new version of repo (%s) is available.", exp_str)
+        logger.warning(
+            "\n... A new version of repo (%s) is available.", exp_str
+        )
         if os.access(repo_path, os.W_OK):
-            logger.warn(
+            logger.warning(
                 """\
 ... You should upgrade soon:
     cp %s %s
@@ -579,7 +572,7 @@ repo: error:
                 repo_path,
             )
         else:
-            logger.warn(
+            logger.warning(
                 """\
 ... New version is available at: %s
 ... The launcher is run from: %s
@@ -797,7 +790,7 @@ def init_http():
             mgr.add_password(p[1], "https://%s/" % host, p[0], p[2])
     except netrc.NetrcParseError:
         pass
-    except IOError:
+    except OSError:
         pass
     handlers.append(_BasicAuthHandler(mgr))
     handlers.append(_DigestAuthHandler(mgr))
